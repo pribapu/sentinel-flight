@@ -51,6 +51,15 @@ Full breakdown, topic list, and package responsibilities:
 - **Dashboard (planned):** FastAPI + React + WebSocket
 - **Edge deployment (planned):** NVIDIA Jetson Orin Nano
 
+## Responsible AI Use
+
+AI-assisted development tools were used selectively during this project to support brainstorming, documentation, code scaffolding, and debugging. AI-generated suggestions were treated as untrusted starting points—not final implementations.
+
+All technical decisions, system architecture, integration work, and project direction were determined by the project author. Suggested code and documentation were manually reviewed, adapted, and tested before being included. In particular, safety-critical behavior was validated through deterministic logic and automated tests rather than relying on generative AI output at runtime.
+
+This approach reflects my belief that AI is most effective as an engineering productivity tool when paired with human judgment, technical understanding, verification, and clear accountability.
+
+
 ## Safety layer
 
 The runtime assurance layer validates every proposed setpoint against:
