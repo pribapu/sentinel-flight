@@ -7,7 +7,7 @@ vs. what's designed-but-not-yet-built, mapped to the original 8-week plan.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Ubuntu 22.04 + ROS 2 Humble + PX4 SITL + Gazebo running | Not started — needs a Linux/WSL2 host |
+| 1 | Ubuntu 22.04 + ROS 2 Humble + PX4 SITL + Gazebo running | **Done** — WSL2 Ubuntu 22.04, ROS 2 Humble, PX4 SITL + Gazebo Harmonic 8.14.0 booting cleanly with the x500 quadcopter (see [evidence/phase1_sitl_gazebo_boot.log](evidence/phase1_sitl_gazebo_boot.log)) |
 | 2 | ROS 2 offboard control (takeoff, waypoint, hover, land) | Design stub (`offboard_controller.py`) |
 | 3 | Telemetry logging (CSV/SQLite) | Design stub (`telemetry_logger.py`), CSV schema fixed |
 | 4 | **Safety gate / runtime assurance layer** | **Implemented + unit tested** (`safety_gate.py`, 14 passing tests) |
@@ -28,8 +28,8 @@ correct with unit tests, independent of simulator availability.
 
 ## Next steps to reach the MVP demo
 
-1. Set up Ubuntu 22.04 or WSL2 with GPU passthrough for Gazebo (Phase 1).
-2. Get PX4 SITL + Gazebo launching with a simulated quadcopter.
+1. ~~Set up Ubuntu 22.04 or WSL2 with GPU passthrough for Gazebo (Phase 1).~~ ✅ done
+2. ~~Get PX4 SITL + Gazebo launching with a simulated quadcopter.~~ ✅ done
 3. Implement `OffboardController` against the running SITL instance
    (Phase 2), reusing the already-defined `Setpoint` contract from
    `safety_gate.py`.
@@ -44,13 +44,29 @@ correct with unit tests, independent of simulator availability.
 
 ## MVP order (fastest path to a legit demo)
 
-1. PX4 + Gazebo drone launches.
+1. PX4 + Gazebo drone launches. ✅ done — see [evidence/phase1_sitl_gazebo_boot.log](evidence/phase1_sitl_gazebo_boot.log)
 2. ROS 2 node makes the drone take off and land.
 3. Safety gate rejects unsafe altitude commands. ✅ done, unit tested.
 4. OpenCV detects a landing marker.
 5. Drone hovers when AI confidence is low.
 6. Telemetry logs safety events.
 7. README + demo video.
+
+## Phase 1 notes (WSL2/Windows-specific)
+
+Built on Windows via WSL2 rather than native Ubuntu or dual-boot:
+
+- The WSL2 host's default Ubuntu release didn't match what ROS 2 Humble and
+  PX4's `ubuntu.sh` officially support, so a dedicated `Ubuntu-22.04` WSL
+  distro was installed alongside it (`wsl --install -d Ubuntu-22.04`).
+- `Tools/setup/ubuntu.sh` hardcodes `/home/$USER/.bashrc`, which breaks when
+  run as root (`$HOME=/root`, not `/home/root`) under `set -e`. Worked around
+  by re-running with `--no-nuttx` — SITL/Gazebo only need the simulation
+  dependencies, not the NuttX firmware toolchain for real flight controllers.
+- `make px4_sitl gz_x500` with the Gazebo GUI enabled produces runaway
+  rendering-warning spam under WSLg (multi-GB logs in minutes). Use
+  `HEADLESS=1 make px4_sitl gz_x500` for SITL work — the physics/flight
+  simulation runs identically, just without the 3D viewer.
 
 ## Advanced additions (post-MVP)
 

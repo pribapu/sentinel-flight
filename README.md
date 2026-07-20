@@ -10,12 +10,13 @@ command before it reaches the flight controller. The AI proposes; the
 safety gate disposes.
 
 > **Status:** the runtime assurance layer (the architectural centerpiece of
-> this project) is implemented and unit tested. The PX4/ROS 2/Gazebo
-> simulation, perception, and dashboard layers are designed and scaffolded
-> but require a Linux/WSL2 environment to build out — see
-> [docs/roadmap.md](docs/roadmap.md) for exactly what's done vs. planned.
-> I'm being upfront about this because half-finished-but-labeled work is
-> worse than an honest roadmap.
+> this project) is implemented and unit tested, and PX4 SITL + Gazebo boots
+> a simulated x500 quadcopter end-to-end (WSL2 Ubuntu 22.04 + ROS 2 Humble —
+> see [evidence/phase1_sitl_gazebo_boot.log](docs/evidence/phase1_sitl_gazebo_boot.log)).
+> ROS 2 offboard control, perception, and the dashboard are designed and
+> scaffolded but not yet wired up — see [docs/roadmap.md](docs/roadmap.md)
+> for exactly what's done vs. planned. I'm being upfront about this because
+> half-finished-but-labeled work is worse than an honest roadmap.
 
 ## Why this matters
 
@@ -44,7 +45,7 @@ Full breakdown, topic list, and package responsibilities:
 
 ## Tech stack
 
-- **Flight control:** PX4 Autopilot, ROS 2 Humble, Gazebo (planned — see roadmap)
+- **Flight control:** PX4 Autopilot, ROS 2 Humble, Gazebo Harmonic (SITL running — offboard control planned, see roadmap)
 - **Runtime assurance:** pure Python state machine, `pytest`
 - **Perception (planned):** OpenCV (ArUco) → YOLOv8n/MobileNet SSD, ONNX/TensorRT
 - **Dashboard (planned):** FastAPI + React + WebSocket
@@ -68,7 +69,7 @@ Full design, state machine diagram, and test matrix:
 ## Features
 
 - [x] Deterministic runtime assurance / safety gate with 14-case unit test suite
-- [ ] PX4 + Gazebo simulated quadcopter
+- [x] PX4 + Gazebo simulated quadcopter (SITL boots end-to-end, see roadmap)
 - [ ] ROS 2 offboard control (takeoff, waypoint nav, hover, land)
 - [ ] Landing-pad detection (OpenCV → learned model)
 - [ ] Mission planner state machine
@@ -119,11 +120,24 @@ This exercises the full safety gate test matrix — 14 passing cases covering
 altitude, velocity, geofence, AI confidence, stale-command, obstacle
 proximity, battery, and mission-abort scenarios.
 
-### What requires the full stack (planned)
+### PX4 SITL + Gazebo (working, via WSL2 Ubuntu 22.04)
 
-The simulation, offboard control, perception, and dashboard layers require
-Ubuntu 22.04 (or WSL2) with ROS 2 Humble, PX4 Autopilot, and Gazebo
-installed. See [docs/roadmap.md](docs/roadmap.md) for the setup sequence.
+```bash
+cd PX4-Autopilot
+HEADLESS=1 make px4_sitl gz_x500
+```
+
+Boots PX4 SITL against a simulated x500 quadcopter in Gazebo Harmonic and
+drops into the interactive `pxh>` shell. See
+[docs/evidence/phase1_sitl_gazebo_boot.log](docs/evidence/phase1_sitl_gazebo_boot.log)
+for a captured boot, and [docs/roadmap.md](docs/roadmap.md#phase-1-notes-wsl2windows-specific)
+for the WSL2-specific setup notes (distro version, NuttX toolchain skip,
+headless flag).
+
+### Offboard control, perception, dashboard (planned)
+
+These layers are designed and scaffolded but not yet wired up to the running
+SITL instance. See [docs/roadmap.md](docs/roadmap.md) for what's next.
 
 ## Results
 
