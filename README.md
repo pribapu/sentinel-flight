@@ -151,11 +151,9 @@ See [docs/roadmap.md](docs/roadmap.md) for the full phase-by-phase plan,
 including GPS-denied navigation with sensor fusion, Jetson deployment with
 TensorRT optimization, and multi-agent simulation.
 
-## Resume bullets
 
-See [docs/resume_bullets.md](docs/resume_bullets.md) — matched to what's
-actually implemented at any given point, so claims stay accurate.
 
 ## License
 
 [MIT](LICENSE)
+s
