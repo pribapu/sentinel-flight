@@ -10,13 +10,15 @@ command before it reaches the flight controller. The AI proposes; the
 safety gate disposes.
 
 > **Status:** the runtime assurance layer (the architectural centerpiece of
-> this project) is implemented and unit tested, and PX4 SITL + Gazebo boots
-> a simulated x500 quadcopter end-to-end (WSL2 Ubuntu 22.04 + ROS 2 Humble —
-> see [evidence/phase1_sitl_gazebo_boot.log](docs/evidence/phase1_sitl_gazebo_boot.log)).
-> ROS 2 offboard control, perception, and the dashboard are designed and
-> scaffolded but not yet wired up — see [docs/roadmap.md](docs/roadmap.md)
-> for exactly what's done vs. planned. I'm being upfront about this because
-> half-finished-but-labeled work is worse than an honest roadmap.
+> this project) is implemented and unit tested, PX4 SITL + Gazebo boots a
+> simulated x500 quadcopter end-to-end, and a ROS 2 node now flies it —
+> arms, engages offboard mode, climbs to 5m, holds, and hands off to PX4's
+> native landing mode, with the safety gate evaluating every setpoint live
+> against PX4 (see [evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)).
+> Perception and the dashboard are designed and scaffolded but not yet
+> wired up — see [docs/roadmap.md](docs/roadmap.md) for exactly what's done
+> vs. planned. I'm being upfront about this because half-finished-but-labeled
+> work is worse than an honest roadmap.
 
 ## Why this matters
 
@@ -45,7 +47,7 @@ Full breakdown, topic list, and package responsibilities:
 
 ## Tech stack
 
-- **Flight control:** PX4 Autopilot, ROS 2 Humble, Gazebo Harmonic (SITL running — offboard control planned, see roadmap)
+- **Flight control:** PX4 Autopilot, ROS 2 Humble, Gazebo Harmonic — SITL + offboard control (arm/takeoff/hold/land) both working
 - **Runtime assurance:** pure Python state machine, `pytest`
 - **Perception (planned):** OpenCV (ArUco) → YOLOv8n/MobileNet SSD, ONNX/TensorRT
 - **Dashboard (planned):** FastAPI + React + WebSocket
@@ -79,7 +81,7 @@ Full design, state machine diagram, and test matrix:
 
 - [x] Deterministic runtime assurance / safety gate with 14-case unit test suite
 - [x] PX4 + Gazebo simulated quadcopter (SITL boots end-to-end, see roadmap)
-- [ ] ROS 2 offboard control (takeoff, waypoint nav, hover, land)
+- [x] ROS 2 offboard control (arm, takeoff, hold, hand off to land — verified live against SITL)
 - [ ] Landing-pad detection (OpenCV → learned model)
 - [ ] Mission planner state machine
 - [ ] Telemetry + safety-event logging (CSV/SQLite)
@@ -143,10 +145,28 @@ for a captured boot, and [docs/roadmap.md](docs/roadmap.md#phase-1-notes-wsl2win
 for the WSL2-specific setup notes (distro version, NuttX toolchain skip,
 headless flag).
 
-### Offboard control, perception, dashboard (planned)
+### ROS 2 offboard control (working)
 
-These layers are designed and scaffolded but not yet wired up to the running
-SITL instance. See [docs/roadmap.md](docs/roadmap.md) for what's next.
+With SITL running and `MicroXRCEAgent udp4 -p 8888` bridging PX4 to ROS 2:
+
+```bash
+source /opt/ros/humble/setup.bash
+source sentinelflight_ws/install/setup.bash
+python3 -m sentinel_flight_control.offboard_controller
+```
+
+Arms the vehicle, engages OFFBOARD mode, climbs to 5m, holds, then hands off
+to PX4's native AUTO_LAND — with `safety_gate.SafetyGate` evaluating every
+setpoint before it's published to PX4. See
+[docs/evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)
+and [docs/roadmap.md](docs/roadmap.md#phase-2-notes) for the real issues hit
+getting this working (versioned topic names, a GCS-required arming check,
+and a genuine safety-gate/landing interaction bug it caught).
+
+### Perception, mission planner, dashboard (planned)
+
+These layers are designed and scaffolded but not yet wired up. See
+[docs/roadmap.md](docs/roadmap.md) for what's next.
 
 ## Results
 

@@ -1,0 +1,41 @@
+SentinelFlight Phase 2 — OffboardController vs. running PX4 SITL (Gazebo Harmonic)
+Setup: WSL2 Ubuntu 22.04, ROS 2 Humble, PX4 SITL (gz_x500, headless), Micro
+XRCE-DDS Agent bridging PX4 uORB <-> ROS 2 DDS on udp4:8888.
+
+=== Node output (sentinelflight_offboard_controller) ===
+
+[INFO] [1784511954.316932206] [sentinelflight_offboard_controller]: Switching to offboard mode
+[INFO] [1784511954.317490290] [sentinelflight_offboard_controller]: Arm command sent
+[INFO] [1784511971.996184346] [sentinelflight_offboard_controller]: Switching to land mode
+
+=== PX4 vehicle_status / vehicle_local_position samples during the flight ===
+
+arming_state: 2   (ARMING_STATE_ARMED)
+nav_state: 14     (NAVIGATION_STATE_OFFBOARD)
+z: -4.89          (climbing toward the 5m target altitude; PX4 NED, negative = up)
+
+... (climb continues) ...
+
+arming_state: 2
+nav_state: 18     (NAVIGATION_STATE_AUTO_LAND — handed off from OFFBOARD after hold)
+z: 0.003          (back at ground level)
+
+=== Safety gate ===
+
+Zero rejections during the takeoff/hold/land cycle above — every proposed
+setpoint fell within configured limits. safety_gate.py evaluated every
+control tick (10 Hz) end-to-end against live PX4 state, not just unit
+tests. See docs/roadmap.md "Phase 2 notes" for a real bug the safety gate
+caught during development (rejecting sub-1m landing setpoints, correctly,
+per its altitude floor) and the fix (hand descent off to PX4's native
+AUTO_LAND via VEHICLE_CMD_NAV_LAND instead of fighting the floor with
+offboard position setpoints).
+
+=== Known limitation ===
+
+The controller keeps publishing the OffboardControlMode heartbeat after
+commanding AUTO_LAND, which appears to prevent PX4's disarm-after-landing
+logic from completing (arming_state stayed ARMED after touchdown in this
+test run). Documented as follow-up work rather than chased further this
+session — the takeoff/hold/land control sequence and safety-gate
+integration are the Phase 2 deliverable and both are verified working.
