@@ -12,13 +12,15 @@ safety gate disposes.
 > **Status:** the runtime assurance layer (the architectural centerpiece of
 > this project) is implemented and unit tested, PX4 SITL + Gazebo boots a
 > simulated x500 quadcopter end-to-end, and a ROS 2 node now flies it —
-> arms, engages offboard mode, climbs to 5m, holds, and hands off to PX4's
-> native landing mode, with the safety gate evaluating every setpoint live
-> against PX4 (see [evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)).
-> Perception and the dashboard are designed and scaffolded but not yet
-> wired up — see [docs/roadmap.md](docs/roadmap.md) for exactly what's done
-> vs. planned. I'm being upfront about this because half-finished-but-labeled
-> work is worse than an honest roadmap.
+> arms, engages offboard mode, climbs to 5m, holds, hands off to PX4's
+> native landing mode, and disarms — with the safety gate evaluating every
+> setpoint live against PX4 and telemetry logged for the full mission (see
+> [evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)
+> and [evidence/phase3_analysis_output.txt](docs/evidence/phase3_analysis_output.txt)).
+> Perception, the mission planner, and the dashboard are designed and
+> scaffolded but not yet wired up — see [docs/roadmap.md](docs/roadmap.md)
+> for exactly what's done vs. planned. I'm being upfront about this because
+> half-finished-but-labeled work is worse than an honest roadmap.
 
 ## Why this matters
 
@@ -82,9 +84,9 @@ Full design, state machine diagram, and test matrix:
 - [x] Deterministic runtime assurance / safety gate with 14-case unit test suite
 - [x] PX4 + Gazebo simulated quadcopter (SITL boots end-to-end, see roadmap)
 - [x] ROS 2 offboard control (arm, takeoff, hold, hand off to land — verified live against SITL)
+- [x] Telemetry + safety-event logging (CSV) — verified against a live 5660-row SITL run
 - [ ] Landing-pad detection (OpenCV → learned model)
 - [ ] Mission planner state machine
-- [ ] Telemetry + safety-event logging (CSV/SQLite)
 - [ ] Live dashboard
 - [ ] Edge deployment on Jetson Orin Nano
 - [ ] Simulation-based failure-mode validation report
@@ -157,11 +159,23 @@ python3 -m sentinel_flight_control.offboard_controller
 
 Arms the vehicle, engages OFFBOARD mode, climbs to 5m, holds, then hands off
 to PX4's native AUTO_LAND — with `safety_gate.SafetyGate` evaluating every
-setpoint before it's published to PX4. See
+setpoint before it's published to PX4, and every tick logged to
+`logs/mission.csv` via `TelemetryLogger`. See
 [docs/evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)
 and [docs/roadmap.md](docs/roadmap.md#phase-2-notes) for the real issues hit
 getting this working (versioned topic names, a GCS-required arming check,
 and a genuine safety-gate/landing interaction bug it caught).
+
+### Telemetry analysis (working)
+
+```bash
+python scripts/analyze_logs.py logs/mission.csv
+```
+
+Summarizes altitude range, AI confidence range, and a safety-status
+breakdown for a mission log. See
+[docs/evidence/phase3_analysis_output.txt](docs/evidence/phase3_analysis_output.txt)
+for real output against the flight above.
 
 ### Perception, mission planner, dashboard (planned)
 

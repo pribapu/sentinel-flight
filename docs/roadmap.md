@@ -9,7 +9,7 @@ vs. what's designed-but-not-yet-built, mapped to the original 8-week plan.
 |---|---|---|
 | 1 | Ubuntu 22.04 + ROS 2 Humble + PX4 SITL + Gazebo running | **Done** — WSL2 Ubuntu 22.04, ROS 2 Humble, PX4 SITL + Gazebo Harmonic 8.14.0 booting cleanly with the x500 quadcopter (see [evidence/phase1_sitl_gazebo_boot.log](evidence/phase1_sitl_gazebo_boot.log)) |
 | 2 | ROS 2 offboard control (takeoff, waypoint, hover, land) | **Done** — `offboard_controller.py` arms PX4, engages OFFBOARD, climbs to 5m, holds, hands off to AUTO_LAND, verified against live SITL with the safety gate evaluating every tick (see [evidence/phase2_offboard_control.log](evidence/phase2_offboard_control.log)) |
-| 3 | Telemetry logging (CSV/SQLite) | Design stub (`telemetry_logger.py`), CSV schema fixed |
+| 3 | Telemetry logging (CSV/SQLite) | **Done** — `telemetry_logger.py` implemented + unit tested, wired into `OffboardController` (one row/tick), verified against a live 5660-row SITL run with `scripts/analyze_logs.py` (see [evidence/phase3_analysis_output.txt](evidence/phase3_analysis_output.txt)) |
 | 4 | **Safety gate / runtime assurance layer** | **Implemented + unit tested** (`safety_gate.py`, 14 passing tests) |
 | 5 | AI perception (landing pad / obstacle detection) | Design stub (`landing_pad_detector.py`) |
 | 6 | Mission planner state machine | Design stub (`mission_manager.py`), state machine + data contracts defined |
@@ -31,7 +31,7 @@ correct with unit tests, independent of simulator availability.
 1. ~~Set up Ubuntu 22.04 or WSL2 with GPU passthrough for Gazebo (Phase 1).~~ ✅ done
 2. ~~Get PX4 SITL + Gazebo launching with a simulated quadcopter.~~ ✅ done
 3. ~~Implement `OffboardController` against the running SITL instance (Phase 2).~~ ✅ done
-4. Implement `TelemetryLogger` against the fixed CSV schema.
+4. ~~Implement `TelemetryLogger` against the fixed CSV schema.~~ ✅ done
 5. Implement `MissionManager.step()` per the state machine already defined
    in `mission_manager.py`, and give it a real cross-node setpoint contract
    (a `sentinel_flight_msgs` interfaces package with a `Setpoint.msg`) so
@@ -51,7 +51,7 @@ correct with unit tests, independent of simulator availability.
 3. Safety gate rejects unsafe altitude commands. ✅ done, unit tested, and verified live against PX4 (see Phase 2 notes below).
 4. OpenCV detects a landing marker.
 5. Drone hovers when AI confidence is low.
-6. Telemetry logs safety events.
+6. Telemetry logs safety events. ✅ done — see [evidence/phase3_analysis_output.txt](evidence/phase3_analysis_output.txt)
 7. README + demo video.
 
 ## Phase 1 notes (WSL2/Windows-specific)
@@ -115,9 +115,23 @@ Issues hit getting a real flight, in order:
 
 Known limitation not yet fixed: the controller keeps publishing the
 `OffboardControlMode` heartbeat after commanding `AUTO_LAND`, which appears
-to block PX4's disarm-after-landing logic — the vehicle stayed armed after
-touchdown in testing. Next step is to stop the heartbeat once landing is
-commanded.
+to slow PX4's disarm-after-landing logic — the vehicle stayed armed
+immediately after touchdown in Phase 2 testing. Update from the Phase 3 run:
+given enough real time (a few minutes, not seconds) it did eventually
+disarm on its own, so this is a delay, not a permanent block — still worth
+fixing by stopping the heartbeat once landing is commanded, just not
+urgent.
+
+## Phase 3 notes
+
+`TelemetryLogger` is a plain CSV writer (like `SafetyGate`, no rclpy
+dependency, unit tested in isolation) called in-process by
+`OffboardController` once per tick, for the same reason the safety gate is
+called in-process rather than over a topic: no `sentinel_flight_msgs`
+interfaces package exists yet for cross-node structured data. A 5660-row
+run (full takeoff -> hold -> `AUTO_LAND` -> disarm) logged with zero
+safety-gate rejections, confirming the Phase 2 landing-altitude bug fix
+holds up over a full mission, not just the one run it was found in.
 
 ## Advanced additions (post-MVP)
 

@@ -1,0 +1,17 @@
+$ python3 scripts/analyze_logs.py logs/mission.csv
+
+Rows: 5660
+Altitude: min=-0.13m max=5.01m avg=0.08m
+AI confidence: min=0.95 max=0.95 avg=0.95
+Safety status breakdown:
+  APPROVED: 5660
+
+Full mission: armed -> climbed to 5.01m -> held -> handed off to AUTO_LAND ->
+disarmed on touchdown. Zero safety-gate rejections across the entire run
+(the Phase 2 landing bug is fixed — see docs/roadmap.md Phase 2 notes).
+Negative min altitude (-0.13m) is ground-level sensor noise, not a real
+below-ground reading.
+
+phase3_mission_sample.csv is the first 80 rows of the 5660-row run this
+analysis covers (full file isn't checked in — see docs/roadmap.md for why
+logs/ is gitignored).

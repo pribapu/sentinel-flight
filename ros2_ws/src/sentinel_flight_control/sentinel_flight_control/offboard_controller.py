@@ -14,6 +14,11 @@ that doesn't exist yet (see docs/roadmap.md "Next steps"). AI confidence is
 synthesized as a constant high value until the perception node (Phase 5) is
 publishing real values.
 
+Also logs one row per tick via TelemetryLogger (Phase 3) — vehicle state,
+attitude, proposed vs. approved setpoint, and the safety gate's decision —
+called in-process for the same reason as the safety gate: no cross-node
+message contract for this data exists yet.
+
 Requires ROS 2 Humble, px4_msgs, and a running PX4 SITL/Gazebo instance
 bridged to ROS 2 via the Micro XRCE-DDS Agent. See docs/roadmap.md.
 
@@ -28,6 +33,7 @@ via `ros2 topic list`, not assumed.
 
 from __future__ import annotations
 
+import math
 import time
 
 import rclpy
@@ -35,6 +41,7 @@ from px4_msgs.msg import (
     BatteryStatus,
     OffboardControlMode,
     TrajectorySetpoint,
+    VehicleAttitude,
     VehicleCommand,
     VehicleLocalPosition,
     VehicleStatus,
@@ -44,11 +51,31 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 
 from sentinel_flight_control.safety_gate import (
     AIStatus,
+    SafetyDecision,
     SafetyGate,
     SafetyStatus,
     Setpoint,
     VehicleState,
 )
+from sentinel_flight_telemetry.telemetry_logger import TelemetryLogger
+
+# Just the nav_states relevant to this mission; anything else logs as its
+# raw integer value rather than growing this map to cover PX4's full enum.
+NAV_STATE_NAMES = {
+    0: "MANUAL",
+    14: "OFFBOARD",
+    17: "AUTO_TAKEOFF",
+    18: "AUTO_LAND",
+}
+
+
+def _quaternion_to_euler(q: list[float]) -> tuple[float, float, float]:
+    """Hamilton (w, x, y, z) quaternion -> (roll, pitch, yaw) in radians."""
+    w, x, y, z = q
+    roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return roll, pitch, yaw
 
 PX4_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -65,7 +92,7 @@ SETPOINTS_BEFORE_OFFBOARD = 10
 
 
 class OffboardController(Node):
-    def __init__(self) -> None:
+    def __init__(self, telemetry_path: str = "logs/mission.csv") -> None:
         super().__init__("sentinelflight_offboard_controller")
 
         self.offboard_control_mode_pub = self.create_publisher(
@@ -94,10 +121,16 @@ class OffboardController(Node):
         self.create_subscription(
             BatteryStatus, "/fmu/out/battery_status_v1", self._on_battery_status, PX4_QOS
         )
+        self.create_subscription(
+            VehicleAttitude, "/fmu/out/vehicle_attitude", self._on_attitude, PX4_QOS
+        )
 
         self.safety_gate = SafetyGate()
+        self.telemetry = TelemetryLogger(telemetry_path)
         self.vehicle_local_position = VehicleLocalPosition()
         self.vehicle_status = VehicleStatus()
+        self.vehicle_attitude = VehicleAttitude()
+        self.vehicle_attitude.q = [1.0, 0.0, 0.0, 0.0]  # identity until the first message arrives
         self.battery_percent = 100.0
         self.setpoint_count = 0
         self.mission_state = "TAKEOFF"
@@ -114,6 +147,9 @@ class OffboardController(Node):
     def _on_battery_status(self, msg: BatteryStatus) -> None:
         if msg.remaining >= 0.0:
             self.battery_percent = msg.remaining * 100.0
+
+    def _on_attitude(self, msg: VehicleAttitude) -> None:
+        self.vehicle_attitude = msg
 
     def _tick(self) -> None:
         self._publish_offboard_heartbeat()
@@ -134,6 +170,41 @@ class OffboardController(Node):
             self.get_logger().warn(f"safety_gate: {decision.status.value} - {decision.reason}")
 
         self._publish_setpoint(decision.setpoint)
+        self._log_telemetry(proposed, decision, vehicle, ai)
+
+    def _log_telemetry(
+        self, proposed: Setpoint, decision: SafetyDecision, vehicle: VehicleState, ai: AIStatus
+    ) -> None:
+        roll, pitch, yaw = _quaternion_to_euler(list(self.vehicle_attitude.q))
+        approved = decision.setpoint
+        self.telemetry.log(
+            {
+                "timestamp": time.time(),
+                "x": vehicle.x,
+                "y": vehicle.y,
+                "z": vehicle.z,
+                "vx": self.vehicle_local_position.vx,
+                "vy": self.vehicle_local_position.vy,
+                "vz": -self.vehicle_local_position.vz,
+                "roll": roll,
+                "pitch": pitch,
+                "yaw": yaw,
+                "flight_mode": NAV_STATE_NAMES.get(
+                    self.vehicle_status.nav_state, self.vehicle_status.nav_state
+                ),
+                "armed_status": self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED,
+                "proposed_x": proposed.x,
+                "proposed_y": proposed.y,
+                "proposed_z": proposed.z,
+                "approved_x": approved.x,
+                "approved_y": approved.y,
+                "approved_z": approved.z,
+                "ai_confidence": ai.confidence,
+                "safety_status": decision.status.value,
+                "rejection_reason": decision.reason,
+                "failsafe_active": self.vehicle_status.failsafe,
+            }
+        )
 
     def _propose_setpoint(self) -> Setpoint:
         """Minimal built-in mission: climb to TAKEOFF_ALTITUDE_M, hold, land."""
@@ -216,6 +287,7 @@ def main(args: list[str] | None = None) -> None:
     try:
         rclpy.spin(node)
     finally:
+        node.telemetry.close()
         node.destroy_node()
         rclpy.shutdown()
 
