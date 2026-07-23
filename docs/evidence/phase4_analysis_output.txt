@@ -1,0 +1,5 @@
+Rows: 9619
+Altitude: min=-0.02m max=5.00m avg=0.11m
+AI confidence: min=0.95 max=0.95 avg=0.95
+Safety status breakdown:
+  APPROVED: 9619

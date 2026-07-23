@@ -12,7 +12,7 @@ vs. what's designed-but-not-yet-built, mapped to the original 8-week plan.
 | 3 | Telemetry logging (CSV/SQLite) | **Done** — `telemetry_logger.py` implemented + unit tested, wired into `OffboardController` (one row/tick), verified against a live 5660-row SITL run with `scripts/analyze_logs.py` (see [evidence/phase3_analysis_output.txt](evidence/phase3_analysis_output.txt)) |
 | 4 | **Safety gate / runtime assurance layer** | **Implemented + unit tested** (`safety_gate.py`, 14 passing tests) |
 | 5 | AI perception (landing pad / obstacle detection) | Design stub (`landing_pad_detector.py`) |
-| 6 | Mission planner state machine | Design stub (`mission_manager.py`), state machine + data contracts defined |
+| 6 | Mission planner state machine | **Done** — `mission_manager.py` implemented + unit tested (17 passing tests), running as its own ROS 2 node (`mission_manager_node.py`) alongside `safety_gate_node.py` and a simplified `offboard_controller.py`, connected over a real `sentinel_flight_msgs` interfaces package instead of one in-process node — verified against live SITL (see [evidence/phase4_node_decomposition.log](evidence/phase4_node_decomposition.log) and [evidence/phase4_analysis_output.txt](evidence/phase4_analysis_output.txt)) |
 | 7 | Live dashboard (FastAPI + React) | Not started, folders scaffolded |
 | 8 | Edge deployment (Jetson Orin Nano / TensorRT) | Not started |
 | 9 | Failure-mode testing + validation report | Started — safety gate test matrix in `docs/safety_layer.md`; full sim-based fault injection pending Phase 1 |
@@ -32,12 +32,12 @@ correct with unit tests, independent of simulator availability.
 2. ~~Get PX4 SITL + Gazebo launching with a simulated quadcopter.~~ ✅ done
 3. ~~Implement `OffboardController` against the running SITL instance (Phase 2).~~ ✅ done
 4. ~~Implement `TelemetryLogger` against the fixed CSV schema.~~ ✅ done
-5. Implement `MissionManager.step()` per the state machine already defined
+5. ~~Implement `MissionManager.step()` per the state machine already defined
    in `mission_manager.py`, and give it a real cross-node setpoint contract
    (a `sentinel_flight_msgs` interfaces package with a `Setpoint.msg`) so
    mission planning, the safety gate, and offboard control can run as
    separate nodes instead of the safety gate being called in-process by
-   `OffboardController` as it is today.
+   `OffboardController` as it is today.~~ ✅ done
 6. Implement `LandingPadDetector` starting with an OpenCV ArUco marker
    (fastest path to an end-to-end demo) before training a model.
 7. Wire the dashboard to the telemetry stream.
@@ -132,6 +132,68 @@ interfaces package exists yet for cross-node structured data. A 5660-row
 run (full takeoff -> hold -> `AUTO_LAND` -> disarm) logged with zero
 safety-gate rejections, confirming the Phase 2 landing-altitude bug fix
 holds up over a full mission, not just the one run it was found in.
+
+## Phase 4 notes
+
+Split the single in-process `OffboardController` (Phase 2/3) into four
+separate ROS 2 nodes — `mission_manager_node`, `safety_gate_node`,
+`offboard_controller`, `telemetry_logger_node` — connected over a new
+`sentinel_flight_msgs` interfaces package (`Setpoint.msg`, `SafetyEvent.msg`),
+and implemented `MissionManager.step()` for real (17 new unit tests in
+`tests/test_mission_manager.py`). Issues hit, in order:
+
+1. **A startup `MISSION_ABORT` landmine, found during design, not at
+   runtime.** `SafetyGate._consecutive_rejections` never resets except on a
+   fully `APPROVED` decision — once it hits 5 it's `MISSION_ABORT`
+   permanently, no recovery. An early design for `MissionManager`'s
+   `INIT`/`ARMING` states proposed "hold at the vehicle's current
+   position," which on the ground is `z≈0` — below `SafetyLimits.min_altitude_m`
+   (1.0m). That would have been rejected every tick and hit `MISSION_ABORT`
+   within 0.5s of every real run. Fixed before it ever ran: `INIT`/`ARMING`/
+   `TAKEOFF` all propose the same climb-to-`TAKEOFF_ALTITUDE_M` setpoint
+   PX4 ignores pre-OFFBOARD anyway, same pattern as the existing
+   pre-offboard setpoint streaming.
+2. **Two pre-existing broken `console_scripts` entry points**, present
+   since Phase 2/3 but never actually exercised because `README.md`'s
+   "How to run" instructions used `python3 -m sentinel_flight_control.offboard_controller`
+   directly rather than `ros2 run`/`ros2 launch`: `setup.py` registered
+   `mission_manager = sentinel_flight_control.mission_manager:main` and
+   `telemetry_logger = sentinel_flight_telemetry.telemetry_logger:main`,
+   but neither module had a `main()` — both would have failed immediately
+   if ever invoked. Replaced with the new node entry points.
+3. **Missing `setup.cfg` meant `ros2 run`/`ros2 launch` silently couldn't
+   find any executable**, even after fixing (2) and a clean `colcon build`
+   succeeding. `ros2 pkg executables sentinel_flight_control` returned
+   nothing, and the built console scripts landed under
+   `install/<pkg>/bin/` instead of the `install/<pkg>/lib/<pkg>/` path
+   `ros2 run` looks in. This is the standard `ament_python` package
+   `setup.cfg` boilerplate (`script_dir`/`install_scripts` pointed at
+   `$base/lib/<package_name>`), just never added to this repo because
+   Phase 2/3 never needed `ros2 run` to work. Added to both
+   `sentinel_flight_control` and `sentinel_flight_telemetry`; confirmed
+   fixed via `ros2 pkg executables`.
+4. **PX4 SITL launched via a background shell survived individual
+   `wsl.exe` invocations fine, but the first launch attempt got killed
+   mid-build ("interrupted by user")** because it was still attached to a
+   pty (`pts/2`) that closed with the invoking session, despite `nohup`.
+   `nohup` only blocks `SIGHUP`; `setsid` was needed to fully detach the
+   process into its own session.
+5. **The known Phase 2/3 "controller keeps heartbeating after AUTO_LAND,
+   delaying disarm" limitation is still present** (not fixed in this
+   phase — landing trigger logic didn't change, just moved to
+   `offboard_controller`'s own independent timer, decoupled from
+   `MissionManager.state` since `MissionState.LAND` is unreachable live
+   without perception — see design note in `mission_manager.py`). This run
+   took roughly 16 minutes to disarm on its own, longer than Phase 3's "a
+   few minutes" — still not chased further, same follow-up item as before.
+
+Verified end-to-end against live SITL with a full arm → climb to 5m → hold
+→ `AUTO_LAND` → disarm cycle, zero safety-gate rejections across 9619 rows,
+and `ros2 topic info`/`node info` confirming the node boundaries are real
+(mission planner never sees a rejected proposal reach PX4; offboard
+controller never sees a raw, unvalidated proposal) — see
+[evidence/phase4_node_decomposition.log](evidence/phase4_node_decomposition.log)
+and [evidence/phase4_analysis_output.txt](evidence/phase4_analysis_output.txt).
 
 ## Advanced additions (post-MVP)
 

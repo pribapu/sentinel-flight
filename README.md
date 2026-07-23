@@ -11,16 +11,20 @@ safety gate disposes.
 
 > **Status:** the runtime assurance layer (the architectural centerpiece of
 > this project) is implemented and unit tested, PX4 SITL + Gazebo boots a
-> simulated x500 quadcopter end-to-end, and a ROS 2 node now flies it —
-> arms, engages offboard mode, climbs to 5m, holds, hands off to PX4's
-> native landing mode, and disarms — with the safety gate evaluating every
-> setpoint live against PX4 and telemetry logged for the full mission (see
-> [evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)
-> and [evidence/phase3_analysis_output.txt](docs/evidence/phase3_analysis_output.txt)).
-> Perception, the mission planner, and the dashboard are designed and
-> scaffolded but not yet wired up — see [docs/roadmap.md](docs/roadmap.md)
-> for exactly what's done vs. planned. I'm being upfront about this because
-> half-finished-but-labeled work is worse than an honest roadmap.
+> simulated x500 quadcopter end-to-end, and the mission now runs as four
+> separate ROS 2 nodes — a mission planner, the safety gate, the PX4
+> offboard controller, and the telemetry logger — connected over a real
+> `sentinel_flight_msgs` interfaces package instead of one in-process node.
+> Verified live: arms, engages offboard mode, climbs to 5m, holds, hands
+> off to PX4's native landing mode, and disarms, with the safety gate
+> evaluating every setpoint across a real process boundary and telemetry
+> logged for the full mission (see
+> [evidence/phase4_node_decomposition.log](docs/evidence/phase4_node_decomposition.log)
+> and [evidence/phase4_analysis_output.txt](docs/evidence/phase4_analysis_output.txt)).
+> Perception and the dashboard are designed and scaffolded but not yet
+> wired up — see [docs/roadmap.md](docs/roadmap.md) for exactly what's done
+> vs. planned. I'm being upfront about this because half-finished-but-labeled
+> work is worse than an honest roadmap.
 
 ## Why this matters
 
@@ -85,8 +89,8 @@ Full design, state machine diagram, and test matrix:
 - [x] PX4 + Gazebo simulated quadcopter (SITL boots end-to-end, see roadmap)
 - [x] ROS 2 offboard control (arm, takeoff, hold, hand off to land — verified live against SITL)
 - [x] Telemetry + safety-event logging (CSV) — verified against a live 5660-row SITL run
+- [x] Mission planner state machine — implemented, unit tested (17 cases), and running as its own ROS 2 node over a real `sentinel_flight_msgs` interfaces package
 - [ ] Landing-pad detection (OpenCV → learned model)
-- [ ] Mission planner state machine
 - [ ] Live dashboard
 - [ ] Edge deployment on Jetson Orin Nano
 - [ ] Simulation-based failure-mode validation report
@@ -103,9 +107,12 @@ sentinelflight/
   README.md
   docs/                    architecture, safety layer, roadmap, demo scenarios, resume bullets
   ros2_ws/src/
-    sentinel_flight_control/     safety_gate.py (implemented), mission_manager.py, offboard_controller.py
-    sentinel_flight_perception/  landing_pad_detector.py
-    sentinel_flight_telemetry/   telemetry_logger.py
+    sentinel_flight_msgs/         Setpoint.msg, SafetyEvent.msg (custom interfaces)
+    sentinel_flight_control/      safety_gate.py, mission_manager.py (both implemented + unit tested),
+                                   mission_manager_node.py, safety_gate_node.py, offboard_controller.py,
+                                   ros_interfaces.py, launch/mission.launch.py
+    sentinel_flight_perception/   landing_pad_detector.py
+    sentinel_flight_telemetry/    telemetry_logger.py (implemented + unit tested), telemetry_logger_node.py
   dashboard/
     backend/ frontend/
   models/
@@ -113,7 +120,7 @@ sentinelflight/
   scripts/
     launch_sim.sh run_mission.sh analyze_logs.py
   tests/
-    test_safety_gate.py
+    test_safety_gate.py test_mission_manager.py test_telemetry_logger.py
   logs/ media/
 ```
 
@@ -129,9 +136,11 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-This exercises the full safety gate test matrix — 14 passing cases covering
+This exercises the full safety gate (14 cases), mission planner (17 cases),
+and telemetry logger (4 cases) test suites — 35 passing cases covering
 altitude, velocity, geofence, AI confidence, stale-command, obstacle
-proximity, battery, and mission-abort scenarios.
+proximity, battery, mission-abort, mission state transitions, and CSV
+logging.
 
 ### PX4 SITL + Gazebo (working, via WSL2 Ubuntu 22.04)
 
@@ -147,24 +156,31 @@ for a captured boot, and [docs/roadmap.md](docs/roadmap.md#phase-1-notes-wsl2win
 for the WSL2-specific setup notes (distro version, NuttX toolchain skip,
 headless flag).
 
-### ROS 2 offboard control (working)
+### ROS 2 mission stack (working, four separate nodes)
 
 With SITL running and `MicroXRCEAgent udp4 -p 8888` bridging PX4 to ROS 2:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source sentinelflight_ws/install/setup.bash
-python3 -m sentinel_flight_control.offboard_controller
+cd ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch sentinel_flight_control mission.launch.py
 ```
 
-Arms the vehicle, engages OFFBOARD mode, climbs to 5m, holds, then hands off
-to PX4's native AUTO_LAND — with `safety_gate.SafetyGate` evaluating every
-setpoint before it's published to PX4, and every tick logged to
-`logs/mission.csv` via `TelemetryLogger`. See
-[docs/evidence/phase2_offboard_control.log](docs/evidence/phase2_offboard_control.log)
-and [docs/roadmap.md](docs/roadmap.md#phase-2-notes) for the real issues hit
-getting this working (versioned topic names, a GCS-required arming check,
-and a genuine safety-gate/landing interaction bug it caught).
+Brings up `mission_manager_node`, `safety_gate_node`, `offboard_controller`,
+and `telemetry_logger_node` as four separate processes wired together over
+the `sentinel_flight_msgs` interfaces package. `mission_manager_node` runs
+`MissionManager.step()` and publishes a *proposed* setpoint;
+`safety_gate_node` is the sole node that decides what actually reaches PX4;
+`offboard_controller` is the only node that talks to PX4 directly (arm,
+engage OFFBOARD, climb to 5m, hold, hand off to native AUTO_LAND);
+`telemetry_logger_node` logs one CSV row per tick. See
+[docs/evidence/phase4_node_decomposition.log](docs/evidence/phase4_node_decomposition.log)
+and [docs/roadmap.md](docs/roadmap.md#phase-4-notes) for the real issues hit
+getting this working (a startup `MISSION_ABORT` landmine found and fixed
+during design, two pre-existing broken console-script entry points, and a
+missing `setup.cfg` that silently broke `ros2 run`/`ros2 launch`).
 
 ### Telemetry analysis (working)
 
@@ -177,7 +193,7 @@ breakdown for a mission log. See
 [docs/evidence/phase3_analysis_output.txt](docs/evidence/phase3_analysis_output.txt)
 for real output against the flight above.
 
-### Perception, mission planner, dashboard (planned)
+### Perception, dashboard (planned)
 
 These layers are designed and scaffolded but not yet wired up. See
 [docs/roadmap.md](docs/roadmap.md) for what's next.
@@ -199,4 +215,3 @@ TensorRT optimization, and multi-agent simulation.
 ## License
 
 [MIT](LICENSE)
-s

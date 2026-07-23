@@ -1,0 +1,100 @@
+SentinelFlight Phase 4 — node decomposition vs. running PX4 SITL (Gazebo Harmonic)
+Setup: WSL2 Ubuntu 22.04, ROS 2 Humble, PX4 SITL (gz_x500, headless), Micro
+XRCE-DDS Agent bridging PX4 uORB <-> ROS 2 DDS on udp4:8888. Four separate
+nodes launched via `ros2 launch sentinel_flight_control mission.launch.py`
+instead of Phase 2/3's single in-process node.
+
+=== Launch output (all four nodes) ===
+
+[INFO] [mission_manager_node-1]: process started with pid [3308]
+[INFO] [safety_gate_node-2]: process started with pid [3310]
+[INFO] [offboard_controller-3]: process started with pid [3312]
+[INFO] [telemetry_logger_node-4]: process started with pid [3314]
+[offboard_controller-3] [INFO] [1784829389.073210256] [sentinelflight_offboard_controller]: Switching to offboard mode
+[offboard_controller-3] [INFO] [1784829389.073860835] [sentinelflight_offboard_controller]: Arm command sent
+[offboard_controller-3] [INFO] [1784829407.038163766] [sentinelflight_offboard_controller]: Switching to land mode
+
+=== ros2 node list — four distinct processes, not one ===
+
+/sentinelflight_mission_manager
+/sentinelflight_offboard_controller
+/sentinelflight_safety_gate
+/sentinelflight_telemetry_logger
+
+=== Proving decoupling, not just "it flew" (the actual point of Phase 4) ===
+
+ros2 topic info /sentinelflight/proposed_setpoint -v
+  Publisher count: 1  -> sentinelflight_mission_manager
+  Subscription count: 2 -> sentinelflight_safety_gate, sentinelflight_telemetry_logger
+  (offboard_controller does NOT subscribe here — it never sees a raw,
+   unvalidated proposal, exactly as docs/architecture.md specifies)
+
+ros2 topic info /sentinelflight/safe_setpoint -v
+  Publisher count: 1  -> sentinelflight_safety_gate (the only node that ever
+  decides what reaches PX4)
+  Subscription count: 2 -> sentinelflight_offboard_controller, sentinelflight_telemetry_logger
+
+ros2 node info /sentinelflight_offboard_controller
+  Subscribers: /fmu/out/vehicle_local_position_v1, /sentinelflight/safe_setpoint
+  Publishers:  /fmu/in/offboard_control_mode, /fmu/in/trajectory_setpoint,
+               /fmu/in/vehicle_command
+  (only node in the graph publishing to any /fmu/in/* topic, confirming
+   "the ONLY node that talks to PX4 directly")
+
+ros2 topic echo /sentinelflight/safety_event --once
+  timestamp: 1784830911.7352014
+  status: 0        (APPROVED)
+  state: 0         (NORMAL)
+  reason: OK
+  ai_confidence: 0.949999988079071
+  failsafe_active: false
+
+ros2 topic echo /sentinelflight/proposed_setpoint --once
+  x: 0.0
+  y: 0.0
+  z: 5.0
+  vx: 0.0
+  vy: 0.0
+  vz: 0.0
+  (MissionManager reached SEARCH and is holding at TAKEOFF_ALTITUDE_M, as
+  expected with no perception publisher yet — see docs/roadmap.md "Phase 4
+  notes")
+
+=== PX4 vehicle_status / vehicle_local_position samples during the flight ===
+
+arming_state: 2   (ARMING_STATE_ARMED)
+nav_state: 14     (NAVIGATION_STATE_OFFBOARD)
+z: -4.99          (holding at the 5m target altitude; PX4 NED, negative = up)
+
+... (hold, then AUTO_LAND handoff) ...
+
+arming_state: 1   (ARMING_STATE_STANDBY — disarmed)
+nav_state: 14
+z: -0.007         (back at ground level)
+
+=== Safety gate ===
+
+Ran scripts/analyze_logs.py against the full arm-through-disarm window
+(docs/evidence/phase4_mission_sample.csv, 9619 rows @ 10 Hz):
+
+  Rows: 9619
+  Altitude: min=-0.02m max=5.00m avg=0.11m
+  AI confidence: min=0.95 max=0.95 avg=0.95
+  Safety status breakdown:
+    APPROVED: 9619
+
+Zero rejections across the full cycle — safety_gate_node evaluated every
+tick end-to-end against live PX4 state, now running as its own process,
+receiving proposals only over /sentinelflight/proposed_setpoint and
+publishing decisions only over /sentinelflight/safe_setpoint and
+/sentinelflight/safety_event.
+
+=== Known limitation (carried over from Phase 2, observed again here) ===
+
+offboard_controller keeps publishing the OffboardControlMode heartbeat
+after commanding AUTO_LAND, which still appears to delay PX4's
+disarm-after-landing logic. In this run it took roughly 16 minutes
+(1784829389 -> ~1784830349) to disarm on its own — longer than the "few
+minutes" observed in Phase 3 — but it did disarm without intervention.
+Still tracked as follow-up work (stop the heartbeat once AUTO_LAND is
+commanded), not fixed in Phase 4.

@@ -19,7 +19,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "telemetry_logger = sentinel_flight_telemetry.telemetry_logger:main",
+            "telemetry_logger_node = sentinel_flight_telemetry.telemetry_logger_node:main",
         ],
     },
 )

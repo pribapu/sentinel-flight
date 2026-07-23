@@ -1,90 +1,46 @@
 """PX4 offboard controller node.
 
 The ONLY node that talks to PX4 directly. Runs the standard PX4 offboard
-handshake (stream setpoints, switch to OFFBOARD, arm) and, on every control
-tick, routes a candidate setpoint through the already-implemented
-SafetyGate (safety_gate.py) before it's published to PX4 — "mission planner
-proposes, safety gate disposes" (docs/architecture.md), applied for real
-against a live flight controller instead of just unit tests.
+handshake (stream setpoints, switch to OFFBOARD, arm) and forwards whatever
+setpoint safety_gate_node last approved on /sentinelflight/safe_setpoint
+straight to PX4 -- "mission planner proposes, safety gate disposes"
+(docs/architecture.md), now true across real ROS 2 node boundaries rather
+than a single in-process call chain (Phase 4).
 
-Mission source for this phase: a minimal built-in takeoff -> hold -> land
-sequence, since MissionManager (Phase 6) isn't wired up to a cross-node
-setpoint topic yet — that needs a custom ROS 2 message type for Setpoint
-that doesn't exist yet (see docs/roadmap.md "Next steps"). AI confidence is
-synthesized as a constant high value until the perception node (Phase 5) is
-publishing real values.
+Landing trigger (known Phase 4 simplification): MissionManager's LAND state
+is unreachable in real runs today because no perception node exists yet
+(Phase 5), so this node keeps the same pragmatic hold-duration timer the
+old single-node mission used in Phase 2/3, decoupled from mission state --
+see docs/roadmap.md "Phase 4 notes".
 
-Also logs one row per tick via TelemetryLogger (Phase 3) — vehicle state,
-attitude, proposed vs. approved setpoint, and the safety gate's decision —
-called in-process for the same reason as the safety gate: no cross-node
-message contract for this data exists yet.
+Requires ROS 2 Humble, px4_msgs, sentinel_flight_msgs, and a running PX4
+SITL/Gazebo instance bridged to ROS 2 via the Micro XRCE-DDS Agent. See
+docs/roadmap.md.
 
-Requires ROS 2 Humble, px4_msgs, and a running PX4 SITL/Gazebo instance
-bridged to ROS 2 via the Micro XRCE-DDS Agent. See docs/roadmap.md.
-
-Reference: PX4 ROS 2 offboard control example —
+Reference: PX4 ROS 2 offboard control example --
 https://docs.px4.io/main/en/ros2/offboard_control
-
-Note: PX4's uXRCE-DDS bridge publishes version-suffixed topic names
-(e.g. /fmu/out/vehicle_status_v4) rather than the unversioned names shown
-in the official example docs — confirmed against a running SITL instance
-via `ros2 topic list`, not assumed.
 """
 
 from __future__ import annotations
 
-import math
 import time
 
 import rclpy
-from px4_msgs.msg import (
-    BatteryStatus,
-    OffboardControlMode,
-    TrajectorySetpoint,
-    VehicleAttitude,
-    VehicleCommand,
-    VehicleLocalPosition,
-    VehicleStatus,
-)
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sentinel_flight_msgs.msg import Setpoint as SetpointMsg
 
-from sentinel_flight_control.safety_gate import (
-    AIStatus,
-    SafetyDecision,
-    SafetyGate,
-    SafetyStatus,
-    Setpoint,
-    VehicleState,
+from sentinel_flight_control.mission_manager import TAKEOFF_ALTITUDE_M, TAKEOFF_ALTITUDE_TOLERANCE_M
+from sentinel_flight_control.ros_interfaces import (
+    PX4_QOS,
+    PX4_TOPIC_OFFBOARD_CONTROL_MODE,
+    PX4_TOPIC_TRAJECTORY_SETPOINT,
+    PX4_TOPIC_VEHICLE_COMMAND,
+    PX4_TOPIC_VEHICLE_LOCAL_POSITION,
+    SAFE_SETPOINT_TOPIC,
 )
-from sentinel_flight_telemetry.telemetry_logger import TelemetryLogger
+from sentinel_flight_control.safety_gate import Setpoint
 
-# Just the nav_states relevant to this mission; anything else logs as its
-# raw integer value rather than growing this map to cover PX4's full enum.
-NAV_STATE_NAMES = {
-    0: "MANUAL",
-    14: "OFFBOARD",
-    17: "AUTO_TAKEOFF",
-    18: "AUTO_LAND",
-}
-
-
-def _quaternion_to_euler(q: list[float]) -> tuple[float, float, float]:
-    """Hamilton (w, x, y, z) quaternion -> (roll, pitch, yaw) in radians."""
-    w, x, y, z = q
-    roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
-    pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
-    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-    return roll, pitch, yaw
-
-PX4_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1,
-)
-
-TAKEOFF_ALTITUDE_M = 5.0
 HOLD_DURATION_S = 10.0
 # PX4 requires setpoints streaming for a short period before it will accept
 # a switch into OFFBOARD mode.
@@ -92,64 +48,37 @@ SETPOINTS_BEFORE_OFFBOARD = 10
 
 
 class OffboardController(Node):
-    def __init__(self, telemetry_path: str = "logs/mission.csv") -> None:
+    def __init__(self) -> None:
         super().__init__("sentinelflight_offboard_controller")
 
         self.offboard_control_mode_pub = self.create_publisher(
-            OffboardControlMode, "/fmu/in/offboard_control_mode", PX4_QOS
+            OffboardControlMode, PX4_TOPIC_OFFBOARD_CONTROL_MODE, PX4_QOS
         )
         self.trajectory_setpoint_pub = self.create_publisher(
-            TrajectorySetpoint, "/fmu/in/trajectory_setpoint", PX4_QOS
+            TrajectorySetpoint, PX4_TOPIC_TRAJECTORY_SETPOINT, PX4_QOS
         )
-        self.vehicle_command_pub = self.create_publisher(
-            VehicleCommand, "/fmu/in/vehicle_command", PX4_QOS
-        )
+        self.vehicle_command_pub = self.create_publisher(VehicleCommand, PX4_TOPIC_VEHICLE_COMMAND, PX4_QOS)
 
-        # Topic names carry PX4's message-version suffix (this checkout
-        # publishes v1/v4 variants) — confirmed via `ros2 topic list`/`topic
-        # info` against the running SITL instance rather than assumed from
-        # the (unversioned) PX4 example docs.
         self.create_subscription(
-            VehicleLocalPosition,
-            "/fmu/out/vehicle_local_position_v1",
-            self._on_local_position,
-            PX4_QOS,
+            VehicleLocalPosition, PX4_TOPIC_VEHICLE_LOCAL_POSITION, self._on_local_position, PX4_QOS
         )
-        self.create_subscription(
-            VehicleStatus, "/fmu/out/vehicle_status_v4", self._on_vehicle_status, PX4_QOS
-        )
-        self.create_subscription(
-            BatteryStatus, "/fmu/out/battery_status_v1", self._on_battery_status, PX4_QOS
-        )
-        self.create_subscription(
-            VehicleAttitude, "/fmu/out/vehicle_attitude", self._on_attitude, PX4_QOS
-        )
+        self.create_subscription(SetpointMsg, SAFE_SETPOINT_TOPIC, self._on_safe_setpoint, 10)
 
-        self.safety_gate = SafetyGate()
-        self.telemetry = TelemetryLogger(telemetry_path)
         self.vehicle_local_position = VehicleLocalPosition()
-        self.vehicle_status = VehicleStatus()
-        self.vehicle_attitude = VehicleAttitude()
-        self.vehicle_attitude.q = [1.0, 0.0, 0.0, 0.0]  # identity until the first message arrives
-        self.battery_percent = 100.0
+        # Safe default before safety_gate_node's first message arrives --
+        # PX4 ignores it anyway pre-OFFBOARD, same as today's pre-offboard streaming.
+        self.latest_safe_setpoint = Setpoint(x=0.0, y=0.0, z=0.0)
         self.setpoint_count = 0
-        self.mission_state = "TAKEOFF"
         self._hold_started_at: float | None = None
+        self._land_commanded = False
 
         self.create_timer(0.1, self._tick)  # 10 Hz
 
     def _on_local_position(self, msg: VehicleLocalPosition) -> None:
         self.vehicle_local_position = msg
 
-    def _on_vehicle_status(self, msg: VehicleStatus) -> None:
-        self.vehicle_status = msg
-
-    def _on_battery_status(self, msg: BatteryStatus) -> None:
-        if msg.remaining >= 0.0:
-            self.battery_percent = msg.remaining * 100.0
-
-    def _on_attitude(self, msg: VehicleAttitude) -> None:
-        self.vehicle_attitude = msg
+    def _on_safe_setpoint(self, msg: SetpointMsg) -> None:
+        self.latest_safe_setpoint = Setpoint(x=msg.x, y=msg.y, z=msg.z, vx=msg.vx, vy=msg.vy, vz=msg.vz)
 
     def _tick(self) -> None:
         self._publish_offboard_heartbeat()
@@ -160,87 +89,20 @@ class OffboardController(Node):
         if self.setpoint_count < SETPOINTS_BEFORE_OFFBOARD + 1:
             self.setpoint_count += 1
 
-        proposed = self._propose_setpoint()
-        vehicle = self._current_vehicle_state()
-        # TODO(phase-5): replace with real perception-derived confidence.
-        ai = AIStatus(confidence=0.95, last_command_timestamp=time.time())
+        self._publish_setpoint(self.latest_safe_setpoint)
+        self._maybe_trigger_land()
 
-        decision = self.safety_gate.evaluate(proposed, vehicle, ai)
-        if decision.status != SafetyStatus.APPROVED:
-            self.get_logger().warn(f"safety_gate: {decision.status.value} - {decision.reason}")
-
-        self._publish_setpoint(decision.setpoint)
-        self._log_telemetry(proposed, decision, vehicle, ai)
-
-    def _log_telemetry(
-        self, proposed: Setpoint, decision: SafetyDecision, vehicle: VehicleState, ai: AIStatus
-    ) -> None:
-        roll, pitch, yaw = _quaternion_to_euler(list(self.vehicle_attitude.q))
-        approved = decision.setpoint
-        self.telemetry.log(
-            {
-                "timestamp": time.time(),
-                "x": vehicle.x,
-                "y": vehicle.y,
-                "z": vehicle.z,
-                "vx": self.vehicle_local_position.vx,
-                "vy": self.vehicle_local_position.vy,
-                "vz": -self.vehicle_local_position.vz,
-                "roll": roll,
-                "pitch": pitch,
-                "yaw": yaw,
-                "flight_mode": NAV_STATE_NAMES.get(
-                    self.vehicle_status.nav_state, self.vehicle_status.nav_state
-                ),
-                "armed_status": self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED,
-                "proposed_x": proposed.x,
-                "proposed_y": proposed.y,
-                "proposed_z": proposed.z,
-                "approved_x": approved.x,
-                "approved_y": approved.y,
-                "approved_z": approved.z,
-                "ai_confidence": ai.confidence,
-                "safety_status": decision.status.value,
-                "rejection_reason": decision.reason,
-                "failsafe_active": self.vehicle_status.failsafe,
-            }
-        )
-
-    def _propose_setpoint(self) -> Setpoint:
-        """Minimal built-in mission: climb to TAKEOFF_ALTITUDE_M, hold, land."""
+    def _maybe_trigger_land(self) -> None:
+        if self._land_commanded:
+            return
         current_altitude = -self.vehicle_local_position.z  # PX4 NED -> altitude-up
-
-        if self.mission_state == "TAKEOFF":
-            if current_altitude >= TAKEOFF_ALTITUDE_M - 0.3:
-                self.mission_state = "HOLD"
+        if self._hold_started_at is None:
+            if current_altitude >= TAKEOFF_ALTITUDE_M - TAKEOFF_ALTITUDE_TOLERANCE_M:
                 self._hold_started_at = time.time()
-            return Setpoint(x=0.0, y=0.0, z=TAKEOFF_ALTITUDE_M)
-
-        if self.mission_state == "HOLD":
-            if self._hold_started_at and time.time() - self._hold_started_at >= HOLD_DURATION_S:
-                self.mission_state = "LAND"
-                self._land()
-            return Setpoint(x=0.0, y=0.0, z=TAKEOFF_ALTITUDE_M)
-
-        # LAND: handed off to PX4's native AUTO_LAND mode (VEHICLE_CMD_NAV_LAND)
-        # rather than commanded via offboard position setpoints. Landing needs
-        # to command altitudes below SafetyLimits.min_altitude_m, which the
-        # safety gate correctly refuses as a position setpoint (an early test
-        # run confirmed this — safety_gate rejected sub-1m setpoints and hit
-        # MISSION_ABORT after 5 rejections). PX4's own AUTO_LAND mode owns
-        # touchdown detection and disarm, matching the pattern in PX4's
-        # reference ROS 2 offboard control example. Hold the last approved
-        # altitude as a harmless setpoint while PX4 transitions out of
-        # OFFBOARD.
-        return Setpoint(x=self.vehicle_local_position.x, y=self.vehicle_local_position.y, z=TAKEOFF_ALTITUDE_M)
-
-    def _current_vehicle_state(self) -> VehicleState:
-        return VehicleState(
-            x=self.vehicle_local_position.x,
-            y=self.vehicle_local_position.y,
-            z=-self.vehicle_local_position.z,
-            battery_percent=self.battery_percent,
-        )
+            return
+        if time.time() - self._hold_started_at >= HOLD_DURATION_S:
+            self._land()
+            self._land_commanded = True
 
     def _publish_offboard_heartbeat(self) -> None:
         msg = OffboardControlMode()
@@ -264,6 +126,13 @@ class OffboardController(Node):
         self.get_logger().info("Switching to offboard mode")
 
     def _land(self) -> None:
+        # Handed off to PX4's native AUTO_LAND mode (VEHICLE_CMD_NAV_LAND)
+        # rather than commanded via offboard position setpoints -- landing
+        # needs to command altitudes below SafetyLimits.min_altitude_m,
+        # which safety_gate_node correctly refuses as a position setpoint
+        # (the Phase 2 landing-altitude bug). PX4's own AUTO_LAND mode owns
+        # touchdown detection and disarm, matching PX4's reference ROS 2
+        # offboard control example.
         self._send_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         self.get_logger().info("Switching to land mode")
 
@@ -287,7 +156,6 @@ def main(args: list[str] | None = None) -> None:
     try:
         rclpy.spin(node)
     finally:
-        node.telemetry.close()
         node.destroy_node()
         rclpy.shutdown()
 
