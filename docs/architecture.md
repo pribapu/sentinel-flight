@@ -45,8 +45,9 @@ deterministic, independently-verifiable safety monitor.
 | `sentinel_flight_control` — `mission_manager_node.py` | ROS 2 wrapper: runs `MissionManager.step()` on a timer, publishes proposed setpoints | Yes |
 | `sentinel_flight_control` — `safety_gate_node.py` | ROS 2 wrapper: runs `SafetyGate.evaluate()` on a timer, publishes safe setpoints + safety events | Yes |
 | `sentinel_flight_control` — `offboard_controller.py` | The only node that talks to PX4: offboard handshake, arm, forwards approved setpoints, triggers AUTO_LAND | Yes |
-| `sentinel_flight_msgs` | Custom interfaces (`Setpoint.msg`, `SafetyEvent.msg`) shared across nodes | Yes (CMake/rosidl) |
-| `sentinel_flight_perception` — `landing_pad_detector.py` | Camera → landing-pad detection + confidence | Yes (OpenCV/model + ROS 2) |
+| `sentinel_flight_msgs` | Custom interfaces (`Setpoint.msg`, `SafetyEvent.msg`, `PerceptionStatus.msg`) shared across nodes | Yes (CMake/rosidl) |
+| `sentinel_flight_perception` — `landing_pad_detector.py` | ArUco marker detection + confidence (pure OpenCV) | No — pure Python, unit tested |
+| `sentinel_flight_perception` — `landing_pad_detector_node.py` | ROS 2 wrapper: subscribes to the bridged camera image, publishes `PerceptionStatus` | Yes |
 | `sentinel_flight_telemetry` — `telemetry_logger.py` | CSV logging of vehicle state + safety decisions | No — pure Python, unit tested |
 | `sentinel_flight_telemetry` — `telemetry_logger_node.py` | ROS 2 wrapper: subscribes to PX4 + SentinelFlight topics, writes one CSV row per tick | Yes |
 | `dashboard/` | Live mission status, AI confidence, safety event timeline | Yes (consumes telemetry) |
@@ -55,10 +56,24 @@ deterministic, independently-verifiable safety monitor.
 
 | Topic | Publisher | Subscriber |
 |---|---|---|
-| `/sentinelflight/perception_status` | Perception node (Phase 5, not yet built) | Mission planner |
+| `/sentinelflight/camera/image_raw` | `ros_gz_bridge` (Gazebo camera → ROS 2) | `landing_pad_detector_node` |
+| `/sentinelflight/perception_status` | `landing_pad_detector_node` | `mission_manager_node`, `safety_gate_node` |
 | `/sentinelflight/proposed_setpoint` | `mission_manager_node` | `safety_gate_node`, `telemetry_logger_node` |
 | `/sentinelflight/safe_setpoint` | `safety_gate_node` | `offboard_controller`, `telemetry_logger_node` |
 | `/sentinelflight/safety_event` | `safety_gate_node` | `telemetry_logger_node`, dashboard (planned) |
+| `/sentinelflight/mission_land_requested` | `mission_manager_node` | `offboard_controller` |
+| `/sentinelflight/mission_trusting_perception` | `mission_manager_node` | `safety_gate_node` |
+
+`safety_gate_node` subscribing to `/sentinelflight/perception_status` is a
+deliberate exception to "mission planner proposes, safety gate disposes"
+being a strict pipeline: the gate needs to know *whether the mission
+planner is currently depending on a perception claim*
+(`mission_trusting_perception`, true only in
+`APPROACH_TARGET`/`ALIGN`/`DESCEND`/`LAND`) before it can decide whether
+that claim's confidence is something worth distrusting — forwarding raw
+perception confidence unconditionally caused a false `MISSION_ABORT`
+during ordinary hover before the mission was ever acting on a faint,
+long-range detection (see [roadmap.md](roadmap.md) "Phase 5 notes").
 
 PX4 topics carry a message-version suffix on this checkout (confirmed live
 against SITL via `ros2 topic list`/`topic info`, not assumed from PX4's

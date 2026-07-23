@@ -11,7 +11,7 @@ vs. what's designed-but-not-yet-built, mapped to the original 8-week plan.
 | 2 | ROS 2 offboard control (takeoff, waypoint, hover, land) | **Done** — `offboard_controller.py` arms PX4, engages OFFBOARD, climbs to 5m, holds, hands off to AUTO_LAND, verified against live SITL with the safety gate evaluating every tick (see [evidence/phase2_offboard_control.log](evidence/phase2_offboard_control.log)) |
 | 3 | Telemetry logging (CSV/SQLite) | **Done** — `telemetry_logger.py` implemented + unit tested, wired into `OffboardController` (one row/tick), verified against a live 5660-row SITL run with `scripts/analyze_logs.py` (see [evidence/phase3_analysis_output.txt](evidence/phase3_analysis_output.txt)) |
 | 4 | **Safety gate / runtime assurance layer** | **Implemented + unit tested** (`safety_gate.py`, 14 passing tests) |
-| 5 | AI perception (landing pad / obstacle detection) | Design stub (`landing_pad_detector.py`) |
+| 5 | AI perception (landing pad / obstacle detection) | **Done (landing-pad detection)** — `landing_pad_detector.py` implements real OpenCV ArUco detection (unit tested, 6 passing tests), running as `landing_pad_detector_node.py` against a live Gazebo camera feed bridged via `ros_gz_bridge`, feeding `mission_manager_node`/`safety_gate_node` over `/sentinelflight/perception_status` — verified against live SITL (see [evidence/phase5_perception_landing.log](evidence/phase5_perception_landing.log)). Obstacle detection not started. |
 | 6 | Mission planner state machine | **Done** — `mission_manager.py` implemented + unit tested (17 passing tests), running as its own ROS 2 node (`mission_manager_node.py`) alongside `safety_gate_node.py` and a simplified `offboard_controller.py`, connected over a real `sentinel_flight_msgs` interfaces package instead of one in-process node — verified against live SITL (see [evidence/phase4_node_decomposition.log](evidence/phase4_node_decomposition.log) and [evidence/phase4_analysis_output.txt](evidence/phase4_analysis_output.txt)) |
 | 7 | Live dashboard (FastAPI + React) | Not started, folders scaffolded |
 | 8 | Edge deployment (Jetson Orin Nano / TensorRT) | Not started |
@@ -38,8 +38,8 @@ correct with unit tests, independent of simulator availability.
    mission planning, the safety gate, and offboard control can run as
    separate nodes instead of the safety gate being called in-process by
    `OffboardController` as it is today.~~ ✅ done
-6. Implement `LandingPadDetector` starting with an OpenCV ArUco marker
-   (fastest path to an end-to-end demo) before training a model.
+6. ~~Implement `LandingPadDetector` starting with an OpenCV ArUco marker
+   (fastest path to an end-to-end demo) before training a model.~~ ✅ done
 7. Wire the dashboard to the telemetry stream.
 8. Run the full failure-mode test matrix in simulation and fill out
    `validation_report.md`.
@@ -49,8 +49,8 @@ correct with unit tests, independent of simulator availability.
 1. PX4 + Gazebo drone launches. ✅ done — see [evidence/phase1_sitl_gazebo_boot.log](evidence/phase1_sitl_gazebo_boot.log)
 2. ROS 2 node makes the drone take off and land. ✅ done — see [evidence/phase2_offboard_control.log](evidence/phase2_offboard_control.log)
 3. Safety gate rejects unsafe altitude commands. ✅ done, unit tested, and verified live against PX4 (see Phase 2 notes below).
-4. OpenCV detects a landing marker.
-5. Drone hovers when AI confidence is low.
+4. OpenCV detects a landing marker. ✅ done — see [evidence/phase5_perception_landing.log](evidence/phase5_perception_landing.log)
+5. Drone hovers when AI confidence is low. ✅ done (the `mission_trusting_perception` fix in Phase 5 notes is exactly this, verified live)
 6. Telemetry logs safety events. ✅ done — see [evidence/phase3_analysis_output.txt](evidence/phase3_analysis_output.txt)
 7. README + demo video.
 
@@ -194,6 +194,120 @@ and `ros2 topic info`/`node info` confirming the node boundaries are real
 controller never sees a raw, unvalidated proposal) — see
 [evidence/phase4_node_decomposition.log](evidence/phase4_node_decomposition.log)
 and [evidence/phase4_analysis_output.txt](evidence/phase4_analysis_output.txt).
+
+## Phase 5 notes
+
+Implemented `LandingPadDetector` (OpenCV ArUco, `cv2.aruco`) and wired it
+in as `landing_pad_detector_node`, the first node in this project to
+consume live camera data rather than just PX4 telemetry. PX4-Autopilot
+ships exactly the right fixtures for this: a downward-facing mono camera
+vehicle variant (`Tools/simulation/gz/models/x500_mono_cam_down`) and a
+world with a 0.5m ArUco marker already placed on the ground
+(`Tools/simulation/gz/worlds/aruco.sdf`, `PX4_GZ_WORLD=aruco`). The
+marker's dictionary/ID (`DICT_4X4_50`, ID 0) was found empirically by
+sweeping `arucotag.png` against every standard `cv2.aruco` dictionary,
+not assumed. `LandingPadDetector` is pure Python/OpenCV (zero rclpy
+dependency, same pattern as `safety_gate.py`/`mission_manager.py`), unit
+tested with synthetic marker images (6 passing tests in
+`tests/test_landing_pad_detector.py`), and uses a small API-compatibility
+shim (`hasattr(cv2.aruco, "ArucoDetector")`) so the same code works on
+both the modern OpenCV 4.7+ class API (Windows' pip `opencv-python`, used
+for fast local unit tests) and the legacy pre-4.7 functional API (WSL's
+pinned apt `python3-opencv`, 4.5.4, which is what actually runs against
+live SITL).
+
+Environment issues found and fixed, in order:
+
+1. **WSL's apt `python3-opencv` (4.5.4) was broken**: `import cv2` failed
+   with a numpy 1.x/2.x ABI mismatch — a pip-installed numpy 2.2.6 was
+   shadowing the apt numpy the system `cv2` was built against. Fixed with
+   `pip3 install 'numpy<2'`.
+2. **`ros-humble-ros-gz` (needed to bridge the Gazebo camera image into
+   ROS 2) wasn't installed**; installed via
+   `sudo apt install ros-humble-ros-gz`.
+3. **The real one: the apt `ros-humble-ros-gz-bridge` package is linked
+   against `ignition-transport11`** (the old "Ignition" Gazebo Transport,
+   pre-Harmonic), while this PX4 checkout's SITL runs Gazebo Sim 8.14.0
+   ("Harmonic") on `gz-transport13` — two separate, incompatible
+   transport buses. Confirmed via `ldd libros_gz_bridge.so` showing
+   `libignition-transport11.so.11`/`libignition-msgs8.so.8`. The bridge
+   process started fine, registered a real ROS 2 publisher, and even
+   showed up in `gz topic -i` as a "subscriber" (actually just gz-sim's
+   own loopback self-reference) — but never received a single frame.
+   `gz topic -e`/`gz topic -l` (built against the correct
+   `gz-transport13`) worked the whole time, which is what pointed at a
+   transport-layer version mismatch rather than a Gazebo-side problem.
+   Fixed by cloning `github.com/gazebosim/ros_gz` (humble branch) and
+   building `ros_gz_interfaces`/`ros_gz_bridge`/`ros_gz_image` from
+   source with `GZ_VERSION=harmonic` against the already-installed
+   `libgz-sim8-dev`/`libgz-transport13-dev`/`libgz-msgs10-dev` headers,
+   then overlaying that workspace's `install/setup.bash`
+   (`--allow-overriding ros_gz_bridge ros_gz_image`) after
+   `/opt/ros/humble` before launching. Confirmed fixed: the rebuilt
+   `libros_gz_bridge.so` links against
+   `libgz-transport13.so.13`/`libgz-msgs10.so.10`, and a real external
+   subscriber address appeared in `gz topic -i` instead of gz-sim's own
+   loopback.
+
+Design bug found via live testing (the actual point of running the full
+system instead of trusting unit tests, same pattern as the Phase 2/4
+interaction bugs): the first mission-stack launch with real perception
+hit `MISSION_ABORT` within seconds of arming, during ordinary
+SEARCH-phase hover. `safety_gate_node` was forwarding raw perception
+confidence to `AIStatus.confidence` *whenever a marker was merely
+visible*, even faint/distant (~0.15-0.4 while still climbing to 5m) —
+below `SafetyLimits.land_confidence_threshold` (0.50), and below
+`MissionManager`'s own `APPROACH_CONFIDENCE_THRESHOLD` (0.80) that would
+ever actually act on it. Five consecutive low-confidence ticks (0.5s at
+10Hz) permanently aborted a mission that wasn't depending on that
+detection at all. Fixed: added `/sentinelflight/mission_trusting_perception`
+(`std_msgs/Bool`, published by `mission_manager_node`, true only in
+`APPROACH_TARGET`/`ALIGN`/`DESCEND`/`LAND`); `safety_gate_node` now only
+forwards real perception confidence when that's true, else the same
+`NO_TARGET_AI_CONFIDENCE=0.95` placeholder used when no target is
+detected at all — keeping "is the mission state machine gated on this
+detection" and "should the safety gate trust this detection" as two
+separate, correctly-scoped questions instead of conflating them.
+
+Verified against live SITL post-fix: real `target_detected: true`,
+`confidence: 0.151...`, real pixel-offset values from the live camera
+feed, and a correspondingly `APPROVED`/`NORMAL` safety event during
+SEARCH-phase hover (no false abort). `offboard_controller`'s
+hold-duration fallback timer then triggered `AUTO_LAND` (MissionManager
+never crossed 0.80 confidence while holding steady at the 5m SEARCH
+altitude — see calibration note below). As PX4's `AUTO_LAND` physically
+descended the vehicle, the marker grew in-frame and confidence rose with
+it; `MissionManager` — still evaluating every tick against the real
+vehicle_z and perception — followed along through
+`APPROACH_TARGET → ALIGN → DESCEND → LAND` on its own
+(`mission_land_requested` flipped `true`), a genuine live confirmation
+that the full state-machine chain and its thresholds work, even though
+it was PX4's descent driving it rather than a `MissionManager`-commanded
+one at that point. During that same descent, confidence fluctuated
+enough (real camera noise, unsmoothed heuristic) to correctly and
+intentionally trip `SafetyGate`'s 5-consecutive-rejection abort a second
+time — this one is the safety gate doing its job, not a bug, but it
+means the mission didn't complete a clean uninterrupted autonomous
+landing this run.
+
+**Known limitation, not fixed this session — confidence heuristic
+calibration.** `LandingPadDetector`'s confidence is
+`min(1, marker_area_px / (frame_area_px * CONFIDENT_AREA_FRACTION))`,
+`CONFIDENT_AREA_FRACTION=0.15`. The camera is wide-FOV
+(`horizontal_fov=1.74` rad, 1280x960) and the marker is small (0.5m); at
+a 5m hover the marker covers only ~0.24% of frame area, giving confidence
+~0.016 with the current constant — calibrated against the wrong
+intuition (a close-up, filled-frame marker) rather than this camera's
+actual geometry. Flagged as follow-up: recalibrate against the real
+geometry above (roughly `CONFIDENT_AREA_FRACTION≈0.003` gets a 5m hover
+near the 0.80 threshold) and/or add hysteresis/smoothing so brief
+confidence dips during a real descent don't accumulate toward
+`SafetyGate`'s fixed 5-rejection abort.
+
+Full run: 3252 telemetry rows, `docs/evidence/phase5_mission_sample.csv`
++ [evidence/phase5_analysis_output.txt](evidence/phase5_analysis_output.txt).
+The known Phase 2/3/4 "heartbeat delays disarm after `AUTO_LAND`"
+limitation is still present, unchanged.
 
 ## Advanced additions (post-MVP)
 

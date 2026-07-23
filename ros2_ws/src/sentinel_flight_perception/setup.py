@@ -19,7 +19,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "landing_pad_detector = sentinel_flight_perception.landing_pad_detector:main",
+            "landing_pad_detector_node = sentinel_flight_perception.landing_pad_detector_node:main",
         ],
     },
 )

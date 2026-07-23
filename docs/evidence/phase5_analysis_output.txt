@@ -1,0 +1,7 @@
+Rows: 3252
+Altitude: min=-0.05m max=4.89m avg=0.80m
+AI confidence: min=0.00 max=1.00 avg=0.29
+Safety status breakdown:
+  MISSION_ABORT: 2259
+  APPROVED: 988
+  FAILSAFE_LAND: 5

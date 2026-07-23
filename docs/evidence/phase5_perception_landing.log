@@ -1,0 +1,150 @@
+SentinelFlight Phase 5 -- OpenCV ArUco landing-pad perception vs. live SITL
+
+Setup: WSL2 Ubuntu 22.04, ROS 2 Humble, PX4 SITL launched against the
+bundled 'aruco' world with the x500_mono_cam_down vehicle
+(PX4_GZ_WORLD=aruco HEADLESS=1 make px4_sitl gz_x500_mono_cam_down),
+Micro XRCE-DDS Agent bridging PX4 uORB <-> ROS 2 DDS, ros_gz_bridge
+bridging the Gazebo camera image into ROS 2, and the six-node stack
+(camera bridge, landing_pad_detector_node, mission_manager_node,
+safety_gate_node, offboard_controller, telemetry_logger_node) launched via
+ros2 launch sentinel_flight_control mission.launch.py.
+
+=== Marker identification (empirical, not assumed) ===
+
+PX4-Autopilot's bundled Tools/simulation/gz/models/arucotag/arucotag.png
+was swept against every standard cv2.aruco predefined dictionary with a
+padded quiet zone (detection on the raw texture alone fails -- no quiet
+zone; a real camera view of the ground plane naturally provides one).
+Result: DICT_4X4_50, marker ID 0. Hardcoded as LandingPadDetector's
+default.
+
+=== Environment issues found and fixed, in order ===
+
+1. WSL's apt python3-opencv (4.5.4) was broken: `import cv2` failed with
+   a numpy 1.x/2.x ABI mismatch (pip's numpy 2.2.6 shadowing the apt
+   numpy the system cv2 was built against). Fixed with
+   `pip3 install 'numpy<2'`.
+2. ros-humble-ros-gz (apt) was not installed; installed via
+   `sudo apt install ros-humble-ros-gz`.
+3. THE BIG ONE: the apt ros-humble-ros-gz-bridge package is linked
+   against ignition-transport11 (the old 'Ignition' Gazebo Transport, pre-
+   Harmonic), while this PX4 checkout's SITL runs Gazebo Sim 8.14.0
+   (Harmonic) on gz-transport13. These are two separate, incompatible
+   transport buses -- confirmed via `ldd libros_gz_bridge.so` showing
+   libignition-transport11.so.11/libignition-msgs8.so.8. The bridge
+   process would start, register a real ROS 2 publisher, and even show up
+   in `gz topic -i` as a "subscriber" (actually just gz-sim's own loopback
+   self-reference), but never actually receive a single frame -- `gz
+   topic -e`/`gz topic -l` (built against the correct gz-transport13)
+   worked fine the whole time, which is what made this a transport-layer
+   mismatch rather than a Gazebo-side problem. Fixed by cloning
+   github.com/gazebosim/ros_gz (humble branch) and building
+   ros_gz_interfaces/ros_gz_bridge/ros_gz_image from source with
+   GZ_VERSION=harmonic against the already-installed libgz-sim8-dev/
+   libgz-transport13-dev/libgz-msgs10-dev headers, then overlaying that
+   workspace's install/setup.bash (--allow-overriding ros_gz_bridge
+   ros_gz_image) after /opt/ros/humble in every shell that runs
+   `ros2 launch`. Confirmed fixed: the rebuilt libros_gz_bridge.so links
+   against libgz-transport13.so.13/libgz-msgs10.so.10, and a subscriber
+   address other than gz-sim's own loopback appeared in `gz topic -i`.
+
+=== Design bug found via live testing, fixed before the good run ===
+
+First mission-stack launch with real perception: SafetyGate hit
+MISSION_ABORT (status 8, state 4, "Repeated unsafe commands from mission
+planner") within seconds of arming, during ordinary SEARCH-phase hover.
+Cause: safety_gate_node forwarded raw perception confidence to
+AIStatus.confidence *whenever a marker was merely visible*, even at
+long range/small-in-frame (~0.15-0.4 confidence while still climbing to
+5m) -- well below SafetyGate.land_confidence_threshold (0.50), and well
+before MissionManager's own APPROACH_CONFIDENCE_THRESHOLD (0.80) would
+ever act on it. Five consecutive low-confidence ticks (0.5s at 10Hz)
+permanently aborted a mission that was never actually depending on that
+detection. Fixed: added /sentinelflight/mission_trusting_perception
+(std_msgs/Bool, published by mission_manager_node, true only in
+APPROACH_TARGET/ALIGN/DESCEND/LAND); safety_gate_node now only forwards
+real perception confidence when that's true, else the same
+NO_TARGET_AI_CONFIDENCE=0.95 placeholder used when no target is detected
+at all.
+
+=== Verified run (post-fix) ===
+
+ros2 topic echo /sentinelflight/perception_status --once (during climb):
+  target_detected: true
+  confidence: 0.15135633945465088
+  center_x_offset: -0.0054687499068677425
+  center_y_offset: 0.012500000186264515
+  (real ArUco detection against the live Gazebo camera feed -- the
+  detector genuinely sees and localizes the marker)
+
+ros2 topic echo /sentinelflight/safety_event --once (same period):
+  status: 0        (APPROVED)
+  state: 0         (NORMAL)
+  reason: OK
+  ai_confidence: 0.949999988079071
+  failsafe_active: false
+  (confirms the mission_trusting_perception fix: real low-confidence
+  detection during SEARCH no longer trips the gate)
+
+No false MISSION_ABORT during SEARCH-phase hover this run (unlike the
+pre-fix attempt). offboard_controller's hold-duration fallback timer
+triggered AUTO_LAND at ~5m after the usual hold period (MissionManager
+never crossed the 0.80 APPROACH_TARGET threshold while holding steady at
+the 5m SEARCH altitude -- see "Confidence heuristic calibration" below).
+
+As PX4's AUTO_LAND then physically descended the vehicle, the marker grew
+in-frame and perception confidence rose with it. MissionManager --
+still evaluating every tick against the real, falling vehicle_z and
+rising confidence -- followed along through APPROACH_TARGET -> ALIGN ->
+DESCEND -> LAND on its own (confirmed:
+/sentinelflight/mission_land_requested flipped true). This is a genuine,
+live confirmation that the full state-machine chain and its confidence
+thresholds work end-to-end -- just triggered by PX4's own descent rather
+than a MissionManager-commanded one, since offboard_controller had
+already handed off to AUTO_LAND by that point.
+
+During that same descent, confidence fluctuated enough (real camera
+noise/vehicle motion, unsmoothed area-based heuristic) to trip
+SafetyGate's max_consecutive_rejections=5 a second time -- correctly and
+intentionally, this time (MissionManager really was depending on
+perception at that point) -- resulting in a second, real MISSION_ABORT
+that then persisted (SafetyState.MISSION_ABORT never auto-recovers) for
+the remainder of the flight. See "Confidence heuristic calibration"
+below.
+
+Final telemetry (scripts/analyze_logs.py against the full run,
+docs/evidence/phase5_mission_sample.csv):
+
+Rows: 3252
+Altitude: min=-0.05m max=4.89m avg=0.80m
+AI confidence: min=0.00 max=1.00 avg=0.29
+Safety status breakdown:
+  MISSION_ABORT: 2259
+  APPROVED: 988
+  FAILSAFE_LAND: 5
+
+=== Confidence heuristic calibration (known limitation, not chased further) ===
+
+LandingPadDetector's confidence is min(1, marker_area_px /
+(frame_area_px * CONFIDENT_AREA_FRACTION)), CONFIDENT_AREA_FRACTION=0.15.
+Camera: horizontal_fov=1.74 rad, 1280x960, marker 0.5m. At a 5m hover,
+ground coverage is ~11.9m wide, so the marker subtends roughly
+0.24% of frame area -- confidence ~0.016 with the current constant, far
+below both MissionManager's 0.80 APPROACH_TARGET threshold and (this run
+showed) unstable in the 0.50-0.70 band during closer-range descent.
+CONFIDENT_AREA_FRACTION was calibrated against the wrong intuition (a
+close-up, filled-frame marker) rather than this camera's actual wide FOV
+and the marker's true angular size at typical operating altitude.
+Flagged as follow-up, not fixed in this session: recalibrate against the
+real geometry above (roughly 0.003 gets a 5m hover near the 0.80
+threshold) and/or add hysteresis/smoothing to the confidence signal so
+brief dips don't accumulate toward SafetyGate's fixed 5-rejection abort
+during a real descent.
+
+=== Known limitation carried over from Phase 4 (unchanged) ===
+
+offboard_controller keeps publishing the OffboardControlMode heartbeat
+after commanding AUTO_LAND, which still appears to delay PX4's
+disarm-after-landing logic (vehicle stayed ARMED, nav_state AUTO_LAND,
+for several minutes after touchdown in this run too) -- not fixed here,
+same follow-up item as Phase 2/3/4.

@@ -10,6 +10,10 @@ set -euo pipefail
 
 PX4_DIR="${PX4_DIR:-../PX4-Autopilot}"
 MODEL="${MODEL:-gz_x500}"
+# Set WORLD to override PX4's default world, e.g. WORLD=aruco with
+# MODEL=gz_x500_mono_cam_down for Phase 5 (landing-pad perception) — see
+# docs/roadmap.md "Phase 5 notes".
+WORLD="${WORLD:-}"
 
 if [ ! -d "$PX4_DIR" ]; then
   echo "PX4-Autopilot not found at $PX4_DIR. Clone it first:" >&2
@@ -19,4 +23,7 @@ if [ ! -d "$PX4_DIR" ]; then
 fi
 
 cd "$PX4_DIR"
+if [ -n "$WORLD" ]; then
+  export PX4_GZ_WORLD="$WORLD"
+fi
 HEADLESS=1 make px4_sitl "$MODEL"

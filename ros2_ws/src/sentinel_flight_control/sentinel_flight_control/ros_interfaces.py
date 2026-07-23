@@ -43,7 +43,9 @@ NAV_STATE_NAMES = {
 PROPOSED_SETPOINT_TOPIC = "/sentinelflight/proposed_setpoint"
 SAFE_SETPOINT_TOPIC = "/sentinelflight/safe_setpoint"
 SAFETY_EVENT_TOPIC = "/sentinelflight/safety_event"
-PERCEPTION_STATUS_TOPIC = "/sentinelflight/perception_status"  # no publisher until Phase 5
+PERCEPTION_STATUS_TOPIC = "/sentinelflight/perception_status"
+MISSION_LAND_REQUESTED_TOPIC = "/sentinelflight/mission_land_requested"
+MISSION_TRUSTING_PERCEPTION_TOPIC = "/sentinelflight/mission_trusting_perception"
 
 
 def quaternion_to_euler(q: list[float]) -> tuple[float, float, float]:

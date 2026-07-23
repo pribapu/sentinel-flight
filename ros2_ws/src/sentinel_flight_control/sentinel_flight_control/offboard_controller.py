@@ -7,11 +7,12 @@ straight to PX4 -- "mission planner proposes, safety gate disposes"
 (docs/architecture.md), now true across real ROS 2 node boundaries rather
 than a single in-process call chain (Phase 4).
 
-Landing trigger (known Phase 4 simplification): MissionManager's LAND state
-is unreachable in real runs today because no perception node exists yet
-(Phase 5), so this node keeps the same pragmatic hold-duration timer the
-old single-node mission used in Phase 2/3, decoupled from mission state --
-see docs/roadmap.md "Phase 4 notes".
+Landing trigger: lands on whichever comes first of (a) mission_manager_node
+reporting MissionState.LAND on /sentinelflight/mission_land_requested (real,
+perception-driven landing, Phase 5) or (b) the pragmatic hold-duration
+timer inherited from Phase 2/3 (a fallback so the vehicle doesn't hover
+forever if no landing target is ever found) -- see docs/roadmap.md
+"Phase 5 notes".
 
 Requires ROS 2 Humble, px4_msgs, sentinel_flight_msgs, and a running PX4
 SITL/Gazebo instance bridged to ROS 2 via the Micro XRCE-DDS Agent. See
@@ -29,9 +30,11 @@ import rclpy
 from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleLocalPosition
 from rclpy.node import Node
 from sentinel_flight_msgs.msg import Setpoint as SetpointMsg
+from std_msgs.msg import Bool
 
 from sentinel_flight_control.mission_manager import TAKEOFF_ALTITUDE_M, TAKEOFF_ALTITUDE_TOLERANCE_M
 from sentinel_flight_control.ros_interfaces import (
+    MISSION_LAND_REQUESTED_TOPIC,
     PX4_QOS,
     PX4_TOPIC_OFFBOARD_CONTROL_MODE,
     PX4_TOPIC_TRAJECTORY_SETPOINT,
@@ -63,6 +66,7 @@ class OffboardController(Node):
             VehicleLocalPosition, PX4_TOPIC_VEHICLE_LOCAL_POSITION, self._on_local_position, PX4_QOS
         )
         self.create_subscription(SetpointMsg, SAFE_SETPOINT_TOPIC, self._on_safe_setpoint, 10)
+        self.create_subscription(Bool, MISSION_LAND_REQUESTED_TOPIC, self._on_mission_land_requested, 10)
 
         self.vehicle_local_position = VehicleLocalPosition()
         # Safe default before safety_gate_node's first message arrives --
@@ -71,6 +75,7 @@ class OffboardController(Node):
         self.setpoint_count = 0
         self._hold_started_at: float | None = None
         self._land_commanded = False
+        self._mission_land_requested = False
 
         self.create_timer(0.1, self._tick)  # 10 Hz
 
@@ -79,6 +84,9 @@ class OffboardController(Node):
 
     def _on_safe_setpoint(self, msg: SetpointMsg) -> None:
         self.latest_safe_setpoint = Setpoint(x=msg.x, y=msg.y, z=msg.z, vx=msg.vx, vy=msg.vy, vz=msg.vz)
+
+    def _on_mission_land_requested(self, msg: Bool) -> None:
+        self._mission_land_requested = msg.data
 
     def _tick(self) -> None:
         self._publish_offboard_heartbeat()
@@ -95,6 +103,14 @@ class OffboardController(Node):
     def _maybe_trigger_land(self) -> None:
         if self._land_commanded:
             return
+
+        if self._mission_land_requested:
+            self._land()
+            self._land_commanded = True
+            return
+
+        # Fallback: no landing target ever found, land anyway rather than
+        # hover forever draining battery.
         current_altitude = -self.vehicle_local_position.z  # PX4 NED -> altitude-up
         if self._hold_started_at is None:
             if current_altitude >= TAKEOFF_ALTITUDE_M - TAKEOFF_ALTITUDE_TOLERANCE_M:

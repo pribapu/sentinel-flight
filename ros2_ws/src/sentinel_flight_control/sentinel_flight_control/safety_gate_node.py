@@ -1,11 +1,13 @@
 """Safety gate node -- the sole authority deciding what reaches PX4.
 
-Subscribes to the mission planner's proposed setpoints and to PX4 vehicle
-state directly (position + battery). Evaluates on its own 10 Hz timer
-(rather than only when a proposal arrives) so failsafe behavior -- stale
-command, low battery -- keeps firing even if the mission planner stalls or
-dies. Publishes the approved/downgraded setpoint and a SafetyEvent
-describing the decision.
+Subscribes to the mission planner's proposed setpoints, PX4 vehicle state
+directly (position + battery), and perception status + mission_trusting_
+perception (Phase 5) to build each tick's AIStatus.confidence (see
+NO_TARGET_AI_CONFIDENCE below). Evaluates on its own 10 Hz timer (rather
+than only when a proposal arrives) so failsafe behavior -- stale command,
+low battery -- keeps firing even if the mission planner stalls or dies.
+Publishes the approved/downgraded setpoint and a SafetyEvent describing
+the decision.
 """
 
 from __future__ import annotations
@@ -15,11 +17,15 @@ import time
 import rclpy
 from px4_msgs.msg import BatteryStatus, VehicleLocalPosition
 from rclpy.node import Node
+from sentinel_flight_msgs.msg import PerceptionStatus
 from sentinel_flight_msgs.msg import SafetyEvent as SafetyEventMsg
 from sentinel_flight_msgs.msg import Setpoint as SetpointMsg
+from std_msgs.msg import Bool
 
 from sentinel_flight_control.mission_manager import TAKEOFF_ALTITUDE_M
 from sentinel_flight_control.ros_interfaces import (
+    MISSION_TRUSTING_PERCEPTION_TOPIC,
+    PERCEPTION_STATUS_TOPIC,
     PROPOSED_SETPOINT_TOPIC,
     PX4_QOS,
     PX4_TOPIC_BATTERY_STATUS,
@@ -35,6 +41,22 @@ from sentinel_flight_control.safety_gate import (
     Setpoint,
     VehicleState,
 )
+
+# AIStatus.confidence to report when the mission planner isn't currently
+# depending on perception (MissionState outside APPROACH_TARGET/ALIGN/
+# DESCEND/LAND -- see mission_manager_node.py's mission_trusting_perception
+# publisher). A SEARCH-phase hover doesn't depend on any AI claim about a
+# target, so there's nothing target-dependent to distrust yet.
+#
+# This is NOT just "confidence when target_detected is False" -- an early
+# live-testing run found forwarding raw perception confidence *whenever a
+# marker was merely visible* (even faint/distant, e.g. 0.4 while still
+# climbing, well before MissionManager's own 0.80 threshold would ever act
+# on it) tripped land_confidence_threshold repeatedly and escalated to a
+# permanent MISSION_ABORT during ordinary startup hover -- the gate was
+# punishing a proposal the mission planner wasn't even conditioning on that
+# data. See docs/roadmap.md "Phase 5 notes".
+NO_TARGET_AI_CONFIDENCE = 0.95
 
 # SafetyStatus/SafetyState enum -> SafetyEvent.msg uint8 constant. Kept in
 # sync by hand with safety_gate.py and sentinel_flight_msgs/msg/SafetyEvent.msg.
@@ -70,6 +92,10 @@ class SafetyGateNode(Node):
             VehicleLocalPosition, PX4_TOPIC_VEHICLE_LOCAL_POSITION, self._on_local_position, PX4_QOS
         )
         self.create_subscription(BatteryStatus, PX4_TOPIC_BATTERY_STATUS, self._on_battery, PX4_QOS)
+        self.create_subscription(PerceptionStatus, PERCEPTION_STATUS_TOPIC, self._on_perception, 10)
+        self.create_subscription(
+            Bool, MISSION_TRUSTING_PERCEPTION_TOPIC, self._on_trusting_perception, 10
+        )
 
         # Safe default before mission_manager_node's first message arrives --
         # matches MissionManager's own INIT/ARMING/TAKEOFF proposal.
@@ -77,6 +103,8 @@ class SafetyGateNode(Node):
         self.last_proposed_received_at: float | None = None
         self.vehicle_local_position = VehicleLocalPosition()
         self.battery_percent = 100.0
+        self.perception_confidence = 0.0
+        self.mission_trusting_perception = False
 
         self.create_timer(0.1, self._tick)  # 10 Hz
 
@@ -91,6 +119,12 @@ class SafetyGateNode(Node):
         if msg.remaining >= 0.0:
             self.battery_percent = msg.remaining * 100.0
 
+    def _on_perception(self, msg: PerceptionStatus) -> None:
+        self.perception_confidence = msg.confidence
+
+    def _on_trusting_perception(self, msg: Bool) -> None:
+        self.mission_trusting_perception = msg.data
+
     def _tick(self) -> None:
         vehicle = VehicleState(
             x=self.vehicle_local_position.x,
@@ -99,9 +133,8 @@ class SafetyGateNode(Node):
             battery_percent=self.battery_percent,
         )
         last_ts = self.last_proposed_received_at if self.last_proposed_received_at is not None else time.time()
-        # TODO(phase-5): replace hardcoded confidence with a real
-        # /sentinelflight/perception_status-derived AIStatus.
-        ai = AIStatus(confidence=0.95, last_command_timestamp=last_ts)
+        confidence = self.perception_confidence if self.mission_trusting_perception else NO_TARGET_AI_CONFIDENCE
+        ai = AIStatus(confidence=confidence, last_command_timestamp=last_ts)
 
         decision = self.gate.evaluate(self.latest_proposed, vehicle, ai)
         if decision.status != SafetyStatus.APPROVED:

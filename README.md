@@ -11,20 +11,22 @@ safety gate disposes.
 
 > **Status:** the runtime assurance layer (the architectural centerpiece of
 > this project) is implemented and unit tested, PX4 SITL + Gazebo boots a
-> simulated x500 quadcopter end-to-end, and the mission now runs as four
-> separate ROS 2 nodes — a mission planner, the safety gate, the PX4
-> offboard controller, and the telemetry logger — connected over a real
-> `sentinel_flight_msgs` interfaces package instead of one in-process node.
-> Verified live: arms, engages offboard mode, climbs to 5m, holds, hands
-> off to PX4's native landing mode, and disarms, with the safety gate
-> evaluating every setpoint across a real process boundary and telemetry
-> logged for the full mission (see
-> [evidence/phase4_node_decomposition.log](docs/evidence/phase4_node_decomposition.log)
-> and [evidence/phase4_analysis_output.txt](docs/evidence/phase4_analysis_output.txt)).
-> Perception and the dashboard are designed and scaffolded but not yet
-> wired up — see [docs/roadmap.md](docs/roadmap.md) for exactly what's done
-> vs. planned. I'm being upfront about this because half-finished-but-labeled
-> work is worse than an honest roadmap.
+> simulated x500 quadcopter end-to-end, and the mission runs as five
+> separate ROS 2 nodes — landing-pad perception, a mission planner, the
+> safety gate, the PX4 offboard controller, and the telemetry logger —
+> connected over a real `sentinel_flight_msgs` interfaces package. Landing-
+> pad detection uses real OpenCV ArUco marker detection against a live
+> Gazebo camera feed, not a stub — verified live: arms, climbs, detects the
+> marker, and the safety gate correctly distinguishes "no target claim to
+> distrust" from "the mission planner is actually depending on this
+> detection" after a live-testing run caught it conflating the two (see
+> [evidence/phase5_perception_landing.log](docs/evidence/phase5_perception_landing.log)).
+> The confidence-vs-altitude calibration needed to complete a clean,
+> uninterrupted autonomous landing in one shot is a documented follow-up,
+> not faked — see [docs/roadmap.md](docs/roadmap.md) "Phase 5 notes" for
+> exactly what worked, what didn't, and why. The dashboard is designed and
+> scaffolded but not yet wired up. I'm being upfront about this because
+> half-finished-but-labeled work is worse than an honest roadmap.
 
 ## Why this matters
 
@@ -39,8 +41,8 @@ in spirit to runtime assurance architectures used in real autonomy systems.
 
 ```mermaid
 flowchart TD
-    A[PX4 + Gazebo Simulation] --> B[ROS 2 Bridge / Topics]
-    B --> C[AI Perception Node]
+    A[PX4 + Gazebo Simulation<br/>+ live camera feed] --> B[ROS 2 Bridge / Topics]
+    B --> C[AI Perception Node<br/>OpenCV ArUco detection]
     C --> D[Mission Planner Node]
     D --> E[Runtime Assurance Layer<br/>Safety Gate]
     E --> F[PX4 Offboard Controller]
@@ -55,7 +57,7 @@ Full breakdown, topic list, and package responsibilities:
 
 - **Flight control:** PX4 Autopilot, ROS 2 Humble, Gazebo Harmonic — SITL + offboard control (arm/takeoff/hold/land) both working
 - **Runtime assurance:** pure Python state machine, `pytest`
-- **Perception (planned):** OpenCV (ArUco) → YOLOv8n/MobileNet SSD, ONNX/TensorRT
+- **Perception:** OpenCV ArUco marker detection against a live Gazebo camera feed, working — learned-model upgrade (YOLOv8n/MobileNet SSD, ONNX/TensorRT) planned
 - **Dashboard (planned):** FastAPI + React + WebSocket
 - **Edge deployment (planned):** NVIDIA Jetson Orin Nano
 
@@ -90,7 +92,7 @@ Full design, state machine diagram, and test matrix:
 - [x] ROS 2 offboard control (arm, takeoff, hold, hand off to land — verified live against SITL)
 - [x] Telemetry + safety-event logging (CSV) — verified against a live 5660-row SITL run
 - [x] Mission planner state machine — implemented, unit tested (17 cases), and running as its own ROS 2 node over a real `sentinel_flight_msgs` interfaces package
-- [ ] Landing-pad detection (OpenCV → learned model)
+- [x] Landing-pad detection (OpenCV ArUco) — implemented, unit tested (6 cases), running against a live Gazebo camera feed; learned-model upgrade planned
 - [ ] Live dashboard
 - [ ] Edge deployment on Jetson Orin Nano
 - [ ] Simulation-based failure-mode validation report
@@ -107,11 +109,11 @@ sentinelflight/
   README.md
   docs/                    architecture, safety layer, roadmap, demo scenarios, resume bullets
   ros2_ws/src/
-    sentinel_flight_msgs/         Setpoint.msg, SafetyEvent.msg (custom interfaces)
+    sentinel_flight_msgs/         Setpoint.msg, SafetyEvent.msg, PerceptionStatus.msg (custom interfaces)
     sentinel_flight_control/      safety_gate.py, mission_manager.py (both implemented + unit tested),
                                    mission_manager_node.py, safety_gate_node.py, offboard_controller.py,
                                    ros_interfaces.py, launch/mission.launch.py
-    sentinel_flight_perception/   landing_pad_detector.py
+    sentinel_flight_perception/   landing_pad_detector.py (implemented + unit tested), landing_pad_detector_node.py
     sentinel_flight_telemetry/    telemetry_logger.py (implemented + unit tested), telemetry_logger_node.py
   dashboard/
     backend/ frontend/
@@ -120,7 +122,7 @@ sentinelflight/
   scripts/
     launch_sim.sh run_mission.sh analyze_logs.py
   tests/
-    test_safety_gate.py test_mission_manager.py test_telemetry_logger.py
+    test_safety_gate.py test_mission_manager.py test_telemetry_logger.py test_landing_pad_detector.py
   logs/ media/
 ```
 
@@ -137,10 +139,10 @@ pytest tests/ -v
 ```
 
 This exercises the full safety gate (14 cases), mission planner (17 cases),
-and telemetry logger (4 cases) test suites — 35 passing cases covering
-altitude, velocity, geofence, AI confidence, stale-command, obstacle
-proximity, battery, mission-abort, mission state transitions, and CSV
-logging.
+telemetry logger (4 cases), and landing-pad detector (6 cases) test suites
+— 41 passing cases covering altitude, velocity, geofence, AI confidence,
+stale-command, obstacle proximity, battery, mission-abort, mission state
+transitions, CSV logging, and ArUco marker detection/offset/confidence.
 
 ### PX4 SITL + Gazebo (working, via WSL2 Ubuntu 22.04)
 
@@ -156,7 +158,15 @@ for a captured boot, and [docs/roadmap.md](docs/roadmap.md#phase-1-notes-wsl2win
 for the WSL2-specific setup notes (distro version, NuttX toolchain skip,
 headless flag).
 
-### ROS 2 mission stack (working, four separate nodes)
+To fly against the landing-pad marker (needed for the perception/mission
+stack below), use the camera-equipped vehicle and PX4's bundled `aruco`
+world instead:
+
+```bash
+PX4_GZ_WORLD=aruco HEADLESS=1 make px4_sitl gz_x500_mono_cam_down
+```
+
+### ROS 2 mission stack (working, five separate nodes)
 
 With SITL running and `MicroXRCEAgent udp4 -p 8888` bridging PX4 to ROS 2:
 
@@ -168,19 +178,27 @@ source install/setup.bash
 ros2 launch sentinel_flight_control mission.launch.py
 ```
 
-Brings up `mission_manager_node`, `safety_gate_node`, `offboard_controller`,
-and `telemetry_logger_node` as four separate processes wired together over
-the `sentinel_flight_msgs` interfaces package. `mission_manager_node` runs
-`MissionManager.step()` and publishes a *proposed* setpoint;
-`safety_gate_node` is the sole node that decides what actually reaches PX4;
-`offboard_controller` is the only node that talks to PX4 directly (arm,
-engage OFFBOARD, climb to 5m, hold, hand off to native AUTO_LAND);
-`telemetry_logger_node` logs one CSV row per tick. See
-[docs/evidence/phase4_node_decomposition.log](docs/evidence/phase4_node_decomposition.log)
-and [docs/roadmap.md](docs/roadmap.md#phase-4-notes) for the real issues hit
-getting this working (a startup `MISSION_ABORT` landmine found and fixed
-during design, two pre-existing broken console-script entry points, and a
-missing `setup.cfg` that silently broke `ros2 run`/`ros2 launch`).
+Brings up a Gazebo→ROS 2 camera bridge, `landing_pad_detector_node`,
+`mission_manager_node`, `safety_gate_node`, `offboard_controller`, and
+`telemetry_logger_node` as five separate processes wired together over the
+`sentinel_flight_msgs` interfaces package. `landing_pad_detector_node` runs
+real OpenCV ArUco detection against the live camera feed;
+`mission_manager_node` runs `MissionManager.step()` and publishes a
+*proposed* setpoint; `safety_gate_node` is the sole node that decides what
+actually reaches PX4; `offboard_controller` is the only node that talks to
+PX4 directly (arm, engage OFFBOARD, climb to 5m, hold, hand off to native
+AUTO_LAND — triggered either by a real perception-driven landing or a
+hold-duration fallback); `telemetry_logger_node` logs one CSV row per tick.
+See [docs/evidence/phase5_perception_landing.log](docs/evidence/phase5_perception_landing.log)
+and [docs/roadmap.md](docs/roadmap.md#phase-5-notes) for the real issues
+hit getting this working, including a Gazebo-Transport-version mismatch
+between the apt `ros_gz_bridge` and this PX4 checkout's Gazebo Harmonic
+build (fixed by building `ros_gz_bridge`/`ros_gz_image` from source), and a
+false-`MISSION_ABORT` bug found via live testing and fixed by teaching the
+safety gate when the mission planner is actually depending on a perception
+claim vs. merely seeing one. Earlier node-split issues (a startup
+`MISSION_ABORT` landmine, broken console-script entry points, a missing
+`setup.cfg`) are in [docs/roadmap.md](docs/roadmap.md#phase-4-notes).
 
 ### Telemetry analysis (working)
 
@@ -190,12 +208,12 @@ python scripts/analyze_logs.py logs/mission.csv
 
 Summarizes altitude range, AI confidence range, and a safety-status
 breakdown for a mission log. See
-[docs/evidence/phase3_analysis_output.txt](docs/evidence/phase3_analysis_output.txt)
-for real output against the flight above.
+[docs/evidence/phase5_analysis_output.txt](docs/evidence/phase5_analysis_output.txt)
+for real output against the perception-enabled flight above.
 
-### Perception, dashboard (planned)
+### Dashboard (planned)
 
-These layers are designed and scaffolded but not yet wired up. See
+This layer is designed and scaffolded but not yet wired up. See
 [docs/roadmap.md](docs/roadmap.md) for what's next.
 
 ## Results
